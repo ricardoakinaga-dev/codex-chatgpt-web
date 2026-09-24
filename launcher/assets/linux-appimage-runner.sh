@@ -1,6 +1,12 @@
 #!/bin/sh
 set -eu
 
+SERVICE_CHILD=false
+if [ "${1:-}" = "--service-child" ]; then
+  SERVICE_CHILD=true
+  shift
+fi
+
 if [ "$#" -lt 1 ]; then
   echo "Codex Web GPT AppImage runner requires an AppImage path" >&2
   exit 64
@@ -14,6 +20,37 @@ esac
 if [ ! -f "$APPIMAGE_PATH" ] || [ ! -x "$APPIMAGE_PATH" ]; then
   echo "Codex Web GPT AppImage is unavailable: $APPIMAGE_PATH" >&2
   exit 66
+fi
+
+# A detached process still belongs to its parent's systemd cgroup. In particular,
+# a short-lived updater can kill the FUSE mount and Chromium children on exit,
+# even after Electron has moved its main process to an application scope.
+# Transfer the entire launch to a service before starting any AppImage children.
+if [ "$SERVICE_CHILD" = false ] && [ -n "${CODEX_WEB_GPT_LAUNCHER_EXECUTABLE:-}" ] \
+  && command -v systemd-run >/dev/null 2>&1 \
+  && command -v systemctl >/dev/null 2>&1 \
+  && systemctl --user show-environment >/dev/null 2>&1; then
+  launch_service() {
+    set -- "$0" --service-child "$APPIMAGE_PATH" "$@"
+    # Inherit only launch-related overrides; values stay in the environment,
+    # rather than appearing in the systemd-run command line or diagnostic log.
+    for name in HOME PATH DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_RUNTIME_DIR \
+      DBUS_SESSION_BUS_ADDRESS LANG LC_ALL TMPDIR APPIMAGE_EXTRACT_AND_RUN \
+      CODEX_WEB_GPT_LAUNCHER_EXECUTABLE CODEX_WEB_GPT_APPIMAGE \
+      CODEX_WEB_GPT_LAUNCHER_DATA_DIR CODEX_WEB_GPT_DEV_HOME \
+      CODEX_CHATGPT_WEB_HOME CODEX_HOME; do
+      if printenv "$name" >/dev/null 2>&1; then
+        set -- "--setenv=$name" "$@"
+      fi
+    done
+    exec systemd-run --user --quiet --collect --service-type=exec \
+      --expand-environment=no --unit="codex-web-gpt-$$" \
+      --property=Restart=on-failure --property=RestartSec=3s \
+      --property=KillMode=mixed --property=TimeoutStopSec=120s \
+      --property=StartLimitIntervalSec=60s --property=StartLimitBurst=3 \
+      "$@"
+  }
+  launch_service "$@"
 fi
 
 fuse_ready() {
