@@ -1540,7 +1540,7 @@ class BrowserHost {
   activateHomeSurface() {
     this.selectedTabId = "home";
     this.syncViewVisibility();
-    if (this.visible && this.surfaceActive) this.activeView().webContents.focus();
+    if (this.visible && this.surfaceActive && this.window?.isFocused?.()) this.activeView().webContents.focus();
     this.publishState?.(this.snapshot());
     this.writeDescriptor();
   }
@@ -1563,7 +1563,7 @@ class BrowserHost {
     if (this.authView) this.closeAuthView(this.authView, true);
     this.selectedTabId = tabId;
     this.syncViewVisibility();
-    if (this.visible && this.surfaceActive) this.activeView().webContents.focus();
+    if (this.visible && this.surfaceActive && this.window?.isFocused?.()) this.activeView().webContents.focus();
     this.publishState?.(this.snapshot());
     this.writeDescriptor();
     return this.snapshot();
@@ -1830,7 +1830,9 @@ class BrowserHost {
     this.visible = true;
     this.syncViewVisibility();
     this.setState({ visible: true });
-    if (this.surfaceActive && this.boundsReady) this.activeView().webContents.focus();
+    // Updating the embedded surface is not a request to activate the desktop window.
+    // Only move keyboard focus within a launcher the user is already using.
+    if (this.surfaceActive && this.boundsReady && this.window?.isFocused?.()) this.activeView().webContents.focus();
   }
 
   async reveal(inspectSession = true) {

@@ -61,13 +61,51 @@ test("a foreground launch request survives hidden startup until the launcher win
     /mainWindowReadyToShow = true;[\s\S]*?if \(mainWindowShowRequested\) showMainWindow\(\);/,
   );
 
-  const secondInstance = electronMain.indexOf('app.on("second-instance", () => showMainWindow())');
+  const secondInstance = electronMain.indexOf('app.on("second-instance", handleSecondInstance)');
   const runtimeMaterialization = electronMain.indexOf("await waitForPackagedRuntimeSource", secondInstance);
   assert.ok(secondInstance >= 0, "the second-instance foreground request must be registered");
   assert.ok(
     runtimeMaterialization > secondInstance,
     "the foreground request must be registered before packaged-runtime startup can block window creation",
   );
+});
+
+test("background relaunch stays hidden while explicit opens activate the launcher", () => {
+  const source = electronMain.slice(
+    electronMain.indexOf("function handleSecondInstance("),
+    electronMain.indexOf("async function openWebUrl"),
+  );
+  let opens = 0;
+  const context = { showMainWindow: () => { opens++; } };
+  require("node:vm").runInNewContext(`${source}; handleSecondInstance(null, ["launcher", "--hidden"]);`, context);
+  assert.equal(opens, 0);
+  require("node:vm").runInNewContext('handleSecondInstance(null, ["launcher"]);', context);
+  assert.equal(opens, 1);
+});
+
+test("hidden startup restores desktop modes only after an explicit show", () => {
+  const handlers = new Map();
+  const calls = [];
+  const window = {
+    once: (event, callback) => handlers.set(event, callback),
+    maximize: () => calls.push("maximize"),
+    setFullScreen: () => calls.push("fullscreen"),
+    show: () => calls.push("show"),
+  };
+  const source = electronMain.slice(
+    electronMain.indexOf('window.once("show",'),
+    electronMain.indexOf("trackWindowState(window"),
+  );
+  require("node:vm").runInNewContext(source, {
+    window, mainWindow: window, mainWindowReadyToShow: false,
+    mainWindowShowRequested: false, startHidden: true,
+    state: { onboardingComplete: true },
+    windowState: { maximized: true, fullscreen: true },
+  });
+  handlers.get("ready-to-show")();
+  assert.deepEqual(calls, []);
+  handlers.get("show")();
+  assert.deepEqual(calls, ["maximize", "fullscreen"]);
 });
 
 test("normal shutdown persists the ChatGPT session before closing browser views", () => {

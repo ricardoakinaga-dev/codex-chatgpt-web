@@ -340,6 +340,11 @@ function showMainWindow() {
   mainWindow.focus();
 }
 
+function handleSecondInstance(_event, argv) {
+  // Autostart/background launches must not activate an existing foreground session.
+  if (!argv.includes("--hidden")) showMainWindow();
+}
+
 async function openWebUrl(url) {
   const parsed = new URL(url);
   if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
@@ -445,10 +450,14 @@ function createWindow({ logger, stateStore, windowStatePath, startHidden }) {
   for (const event of ["enter-full-screen", "leave-full-screen", "maximize", "unmaximize"]) {
     window.on(event, () => send("launcher:window-state-changed", windowStateSnapshot(window)));
   }
-  window.once("ready-to-show", () => {
-    if (!state.onboardingComplete && !Number.isFinite(windowState.bounds.x)) window.center();
+  window.once("show", () => {
+    // Restoring maximized/fullscreen state can itself show a hidden native window.
+    // Defer that restoration until the user actually opens it.
     if (windowState.maximized) window.maximize();
     if (windowState.fullscreen) window.setFullScreen(true);
+  });
+  window.once("ready-to-show", () => {
+    if (!state.onboardingComplete && !Number.isFinite(windowState.bounds.x)) window.center();
     if (mainWindow === window) mainWindowReadyToShow = true;
     if (mainWindowShowRequested) showMainWindow();
     else if (!startHidden) window.show();
@@ -1033,7 +1042,7 @@ async function start() {
     app.quit();
     return;
   }
-  app.on("second-instance", () => showMainWindow());
+  app.on("second-instance", handleSecondInstance);
   app.on("activate", () => showMainWindow());
 
   await waitForPackagedRuntimeSource({ app, resourcesPath: process.resourcesPath });

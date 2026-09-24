@@ -2037,6 +2037,7 @@ test("manual operations show the home surface without discarding retained task t
     turnTabs: new Map([[taskTab.id, taskTab]]),
     visible: true,
     surfaceActive: true,
+    window: { isFocused: () => true },
     activeView: () => ({ webContents: { focus: () => events.push("focus") } }),
     syncViewVisibility: () => events.push("visibility"),
     snapshot: () => ({ activeTabId: "home" }),
@@ -2102,6 +2103,7 @@ test("selecting a task tab shows and focuses its owned Playwright surface", () =
     bounds: { x: 260, y: 78, width: 800, height: 600 },
     authView: null,
     window: {
+      isFocused: () => true,
       getContentSize: () => [1120, 720],
       isMinimized: () => false,
       isVisible: () => true,
@@ -2121,6 +2123,24 @@ test("selecting a task tab shows and focuses its owned Playwright surface", () =
   ]);
   assert.deepEqual(focused, ["second"]);
   assert.equal(state.activeTabId, second.id);
+});
+
+test("background browser updates never take native focus from another application", () => {
+  for (const method of ["show", "activateHomeSurface", "selectTab"]) {
+    for (const focused of [false, true]) {
+      const events = [];
+      const fixture = {
+        visible: true, surfaceActive: true, boundsReady: true,
+        window: { isFocused: () => focused },
+        turnTabs: new Map(), authView: null,
+        activeView: () => ({ webContents: { focus: () => events.push("focus") } }),
+        syncViewVisibility: () => events.push("visibility"),
+        setState() {}, snapshot() {}, publishState() {}, writeDescriptor() {},
+      };
+      BrowserHost.prototype[method].call(fixture, "home");
+      assert.deepEqual(events, focused ? ["visibility", "focus"] : ["visibility"], method);
+    }
+  }
 });
 
 test("a stale helper cannot end a replacement turn with the same trace id", async () => {
