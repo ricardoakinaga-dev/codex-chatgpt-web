@@ -7,7 +7,7 @@ type EffortMenu = Awaited<ReturnType<typeof activateChatGptEffortMenu>>;
 
 function familyError(family: ChatGptWebModelFamily, cause?: unknown): ChatGptWebAdapterError {
   return new ChatGptWebAdapterError(
-    `ChatGPT model ${family} could not be selected and verified. The pending message was not sent. Check the model in the browser; if ChatGPT uses an unsupported language, select English in Settings → General → Language and reload it.`,
+    `ChatGPT model ${family} could not be selected and verified. The pending message was not sent. Check whether the requested model is available in the browser and reload it before retrying.`,
     { status: 400, errorType: "invalid_request_error", code: "model_version_unavailable", retryable: false, cause },
   );
 }
@@ -34,9 +34,24 @@ export async function selectChatGptModelFamily(
     if (await option.count() > 1) throw familyError(family);
     if (await option.count() === 1 && await option.getAttribute("aria-checked") === "true") return menu;
     // The attached radio rows are inert while this composer-owned advanced view is collapsed.
-    const trigger = menu.menu.locator('[role="menuitem"][aria-expanded][aria-hidden="false"]');
-    if (await trigger.count() !== 1) throw familyError(family);
-    if (await trigger.getAttribute("aria-expanded") === "false") await trigger.click({ timeout: 5_000 });
+    const view = menu.menu.locator("[data-model-picker-view]");
+    const viewCount = await view.count();
+    if (viewCount > 1) throw familyError(family);
+    if (viewCount === 1) {
+      // The current picker toggles between simple/advanced views without exposing
+      // aria-expanded. Opening an already-advanced picker would hide the radio rows.
+      const state = await view.getAttribute("data-model-picker-view");
+      if (state !== "simple" && state !== "advanced") throw familyError(family);
+      if (state === "simple") {
+        const toggle = menu.menu.locator('[role="menuitem"][data-model-picker-view-toggle="true"][aria-hidden="false"]');
+        if (await toggle.count() !== 1) throw familyError(family);
+        await toggle.click({ timeout: 5_000 });
+      }
+    } else {
+      const trigger = menu.menu.locator('[role="menuitem"][aria-expanded][aria-hidden="false"]');
+      if (await trigger.count() !== 1) throw familyError(family);
+      if (await trigger.getAttribute("aria-expanded") === "false") await trigger.click({ timeout: 5_000 });
+    }
     await option.waitFor({ state: "visible", timeout: 5_000 });
     await option.click({ timeout: 5_000 });
     await page.keyboard.press("Escape");

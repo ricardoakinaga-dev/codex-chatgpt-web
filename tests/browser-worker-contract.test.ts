@@ -153,7 +153,7 @@ test("submission DOM tracks logical identities and retains virtualized history i
   await expect(worker.submissionDomState(page, baseline.domCache)).rejects.toThrow("duplicate");
 });
 
-test("paired turn identities survive virtualization and never count restored history as a new submission", async () => {
+test("paired turn identities survive virtualization and temporary display keys without inventing new submissions", async () => {
   const pairs = [{ key: "old-pair", mounted: false }];
   const observers: Array<() => void> = [];
   const element = (key: string) => ({
@@ -183,6 +183,14 @@ test("paired turn identities survive virtualization and never count restored his
   const baseline = await worker.captureSubmissionBaseline(page);
   expect([...baseline.initialTurnIdentities]).toEqual(["paired:user:old-pair", "paired:assistant:old-pair"]);
   pairs[0]!.mounted = true;
+  observers.forEach(notify => notify());
+  expect(await worker.currentSubmissionEvidence(page, baseline)).toBeUndefined();
+  // Sol hydration briefly replaces its UUID with an index and then restores it.
+  pairs[0]!.key = "fallback-turn-0";
+  observers.forEach(notify => notify());
+  expect(await worker.currentSubmissionEvidence(page, baseline)).toBeUndefined();
+  expect([...(await worker.submissionDomState(page, baseline.domCache)).responseIdentities]).toEqual([]);
+  pairs[0]!.key = "old-pair";
   observers.forEach(notify => notify());
   expect(await worker.currentSubmissionEvidence(page, baseline)).toBeUndefined();
   pairs.push({ key: "new-pair", mounted: true });

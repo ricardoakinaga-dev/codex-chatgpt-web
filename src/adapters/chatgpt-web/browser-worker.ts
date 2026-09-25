@@ -2912,7 +2912,11 @@ export class ChatGptBrowserWorker {
       // The current renderer has one persistent UUID container for a user/assistant pair.
       // Record both roles in the baseline even while its inner content is virtualized,
       // so rehydrating history cannot masquerade as a new answer.
-      const pairedKeys = identities([...document.querySelectorAll("[data-turn-key]")], "data-turn-key");
+      // During local-to-server hydration the same pair briefly uses a display-index
+      // placeholder. It is not a new logical turn and must never replace a bound UUID.
+      const stablePair = (element: Element): boolean =>
+        !/^fallback-turn-\d+$/.test(element.getAttribute("data-turn-key") ?? "");
+      const pairedKeys = identities([...document.querySelectorAll("[data-turn-key]")].filter(stablePair), "data-turn-key");
       const turnIdentities = [
         ...identities(containers, "data-turn-id-container"),
         ...pairedKeys.flatMap(key => [`paired:user:${key}`, `paired:assistant:${key}`]),
@@ -2920,7 +2924,7 @@ export class ChatGptBrowserWorker {
       const roleIdentities = (selector: string, role: string): string[] => {
         const elements = [...document.querySelectorAll(selector)];
         const legacy = elements.filter(element => !element.hasAttribute("data-turn-key"));
-        const paired = elements.filter(element => element.hasAttribute("data-turn-key"));
+        const paired = elements.filter(element => element.hasAttribute("data-turn-key") && stablePair(element));
         return [...identities(legacy, "data-turn-id"),
           ...identities(paired, "data-turn-key").map(key => `paired:${role}:${key}`)];
       };
