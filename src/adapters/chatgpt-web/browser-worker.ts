@@ -4273,7 +4273,13 @@ export class ChatGptBrowserWorker {
         ...(segment.group ? { group: segment.group } : {}),
         ...(segment.sourceStart !== undefined ? { sourceStart: segment.sourceStart } : {}),
         ...(segment.sourceEnd !== undefined ? { sourceEnd: segment.sourceEnd } : {}),
-        streamable: index < segments.length - 1 && !segment.pendingLinks,
+        // Paired-turn Markdown has no immutable per-block identity. The renderer can
+        // replace/reorder earlier paragraphs after tool calls, reusing our positional
+        // keys. Keep it mutable until the normal completion tracker + broker fence
+        // authorize finish(); elapsed stability alone cannot make these blocks final.
+        // Legacy source-block streaming and its consistency checks remain unchanged.
+        streamable: !root.hasAttribute("data-turn-key")
+          && index < segments.length - 1 && !segment.pendingLinks,
         linkTargets: segment.linkTargets,
       }));
       const rendered = renderedRoots.at(-1);

@@ -139,3 +139,40 @@ test("paired turns read only assistant Markdown and require an external completi
   expect(completed.completionActionVisible).toBeTrue();
   expect(completed.fullHtml).not.toContain("SECRET USER PROMPT");
 });
+
+test("paired renderer revisions after tool calls are buffered until completion without leaking stale paragraphs", async () => {
+  const paired = (answer: string, completed = false) => `<div id="turn" data-turn-key="active-pair">
+    <div data-user-message-bubble="true">Private task input</div>
+    <div data-markdown-text-style="assistant-message">${answer}</div>
+    ${completed ? '<button aria-label="Copiar"></button>' : ''}
+  </div>`;
+  const buffer = new ChatGptMarkdownBuffer();
+  const initial = await snapshot(paired('<p>Vou verificar os arquivos.</p><p>Preparando a primeira etapa.</p>'));
+  expect(buffer.observe(initial.markdownSegments, 0)).toBe("");
+  // This used to commit positional block 0 after 750 ms, although it can still change.
+  expect(buffer.observe(initial.markdownSegments, 10_000)).toBe("");
+  const revised = await snapshot(paired('<p>Executei as verificações e corrigi os problemas encontrados.</p><p>Validando os testes.</p>'));
+  expect(buffer.observe(revised.markdownSegments, 20_000)).toBe("");
+  expect(buffer.observe(revised.markdownSegments, 30_000)).toBe("");
+  const final = await snapshot(paired('<h2>Resultado</h2><p>Correção concluída.</p><ul><li>Testes passaram.</li><li>Dados preservados.</li></ul>', true));
+  expect(buffer.observe(final.markdownSegments, 40_000)).toBe("");
+  expect(final.completionActionVisible).toBeTrue();
+  expect(buffer.currentSnapshotIsConsistent()).toBeTrue();
+  const completed = buffer.finish();
+  expect(completed.markdown).toBe("## Resultado\n\nCorreção concluída.\n\n- Testes passaram.\n- Dados preservados.");
+  expect(completed.delta).toBe(completed.markdown);
+  expect(completed.markdown).not.toContain("Vou verificar");
+  expect(completed.markdown).not.toContain("Private task input");
+});
+
+test("legacy renderer still streams completed blocks and rejects genuine committed-text rewrites", async () => {
+  const legacy = (text: string) => `<section id="turn"><div class="markdown"><p data-start="0" data-end="25">${text}</p><p data-start="26" data-end="60">Next block</p></div></section>`;
+  const buffer = new ChatGptMarkdownBuffer();
+  const first = await snapshot(legacy("Original paragraph"));
+  expect(buffer.observe(first.markdownSegments, 0)).toBe("");
+  expect(buffer.observe(first.markdownSegments, 1000)).toBe("Original paragraph");
+  const changed = await snapshot(legacy("Changed paragraph"));
+  buffer.observe(changed.markdownSegments, 2000);
+  expect(buffer.currentSnapshotIsConsistent()).toBeFalse();
+  expect(() => buffer.finish()).toThrow("completed text block");
+});
