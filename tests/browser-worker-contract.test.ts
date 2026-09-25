@@ -11,7 +11,7 @@ import { chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter
 import { CHATGPT_STOPPED_THINKING_LABELS } from "../src/adapters/chatgpt-web/ui-labels";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
 import { CHATGPT_CONNECTOR_NAME, DEV_CHATGPT_CONNECTOR_NAME, defaultChromeExecutable, legacyChatGptConnectorMigrationMessage } from "../src/config";
-import { parseChatGptEffortSliderState } from "../src/chatgpt-session";
+import { CHATGPT_TEMPORARY_CHAT_URL, parseChatGptEffortSliderState } from "../src/chatgpt-session";
 import { ChatGptExternalTurnProgress, chatGptExternalToolCallsAreInFlight } from "../src/adapters/chatgpt-web/turn-progress";
 import type { CodexProviderConfig } from "../src/types";
 import { compileChatGptWebPrompt, formatChatGptWebMultipartCommit, formatChatGptWebMultipartStage } from "../src/adapters/chatgpt-web/prompt";
@@ -101,6 +101,7 @@ test("submission DOM tracks logical identities and retains virtualized history i
   ];
   const observers: (() => void)[] = [];
   const element = (turn: Turn, container: boolean) => ({
+    hasAttribute: () => false,
     getAttribute: (name: string) => ({
       "data-turn-id": container ? null : turn.id,
       "data-turn-id-container": turn.id,
@@ -148,6 +149,48 @@ test("submission DOM tracks logical identities and retains virtualized history i
   observers.forEach(notify => notify());
   expect(await worker.currentSubmissionEvidence(page, baseline)).toBe("user_turn");
   turns.push({ ...turns[3]!, index: 20 });
+  observers.forEach(notify => notify());
+  await expect(worker.submissionDomState(page, baseline.domCache)).rejects.toThrow("duplicate");
+});
+
+test("paired turn identities survive virtualization and never count restored history as a new submission", async () => {
+  const pairs = [{ key: "old-pair", mounted: false }];
+  const observers: Array<() => void> = [];
+  const element = (key: string) => ({
+    hasAttribute: (name: string) => name === "data-turn-key",
+    getAttribute: (name: string) => name === "data-turn-key" ? key : null,
+  });
+  const context = createContext({
+    performance: { timeOrigin: 1 },
+    document: {
+      documentElement: {},
+      querySelectorAll: (selector: string) => {
+        if (selector === "[data-turn-id-container]") return [];
+        if (selector === "[data-turn-key]") return pairs.map(pair => element(pair.key));
+        if (selector.includes('="user"') || selector.includes('="assistant"')) {
+          return pairs.filter(pair => pair.mounted).map(pair => element(pair.key));
+        }
+        return [];
+      },
+    },
+    MutationObserver: class { constructor(callback: () => void) { observers.push(callback); } observe() {} },
+  });
+  const page = {
+    evaluate: async (callback: Function, options: unknown) => runInContext(`(${callback.toString()})`, context)(options),
+    locator: () => ({}),
+  } as unknown as Page;
+  const worker = Object.create(ChatGptBrowserWorker.prototype) as any;
+  const baseline = await worker.captureSubmissionBaseline(page);
+  expect([...baseline.initialTurnIdentities]).toEqual(["paired:user:old-pair", "paired:assistant:old-pair"]);
+  pairs[0]!.mounted = true;
+  observers.forEach(notify => notify());
+  expect(await worker.currentSubmissionEvidence(page, baseline)).toBeUndefined();
+  pairs.push({ key: "new-pair", mounted: true });
+  observers.forEach(notify => notify());
+  expect(await worker.currentSubmissionEvidence(page, baseline)).toBe("user_turn");
+  expect([...(await worker.submissionDomState(page, baseline.domCache)).responseIdentities])
+    .toEqual(["paired:assistant:old-pair", "paired:assistant:new-pair"]);
+  pairs.push({ key: "new-pair", mounted: true });
   observers.forEach(notify => notify());
   await expect(worker.submissionDomState(page, baseline.domCache)).rejects.toThrow("duplicate");
 });
@@ -622,7 +665,7 @@ test("an accepted Full-mode send survives one stalled DOM probe and a later MCP 
     press: async () => { sendPresses += 1; },
   };
   const composer = {
-    locator: () => ({ getByTestId: () => sendButton }),
+    locator: () => ({ locator: () => sendButton }),
   };
   worker.activeComposer = async () => composer;
 
@@ -744,7 +787,7 @@ test("Bigger Context send activation keeps the outer stage budget instead of res
     },
   };
   worker.activeComposer = async () => ({
-    locator: () => ({ getByTestId: () => sendButton }),
+    locator: () => ({ locator: () => sendButton }),
   });
   worker.waitForSubmissionAcceptedWithRecovery = async () => "user_turn";
 
@@ -1471,7 +1514,7 @@ test("repeated connector verification reuses its selected pill before clearing t
   expect(checkpoints).toEqual(["personalization-already-enabled", "connector-already-selected"]);
 });
 
-test("connector selection retriggers the complete mention after a fresh-page hydration miss", async () => {
+test.each(["legacy", "prosemirror"])("connector selection retriggers the complete mention after a fresh-page hydration miss (%s)", async schema => {
   const calls: string[] = [];
   let menuAttempt = 0;
   let selected = false;
@@ -1491,7 +1534,9 @@ test("connector selection retriggers the complete mention after a fresh-page hyd
       if (menuAttempt === 1) throw timeout;
     },
     count: async () => 1,
-    getAttribute: async (name: string) => name === "data-highlighted" ? "" : null,
+    getAttribute: async (name: string) => schema === "legacy"
+      ? name === "data-highlighted" ? "" : null
+      : name === "aria-current" ? "true" : null,
   };
   const selectedComposer = {
     locator: () => ({ filter: () => selectedConnector }),
@@ -2310,8 +2355,8 @@ test("image attachment readiness uses exact file tiles and not localized remove-
         },
       };
     },
-    getByTestId: (testId: string) => {
-      expect(testId).toBe("send-button");
+    locator: (selector: string) => {
+      expect(selector).toBe('[data-testid="send-button"], button[type="submit"]');
       return send;
     },
   };
@@ -2816,6 +2861,23 @@ test("a failed subscription fetch is retryable and does not falsely invalidate C
     errorType: "server_error",
     code: "chatgpt_subscription_unavailable",
     retryable: true,
+  });
+});
+
+test.each([
+  ["", 502, "chatgpt_surface_unavailable", true],
+  ["Your session has expired. Please log in again to continue using the app.", 401, "chatgpt_session_expired", false],
+] as const)("new chat composer failure keeps session evidence authoritative: %s", async (alert, status, code, retryable) => {
+  const page = Object.assign(dialogPage(alert).page, { url: () => CHATGPT_TEMPORARY_CHAT_URL });
+  const worker = Object.assign(Object.create(ChatGptBrowserWorker.prototype), {
+    activeComposer: async (_page: Page, timeoutMs: number) => {
+      expect(timeoutMs).toBe(60_000);
+      throw new Error("No visible composer after navigation");
+    },
+  }) as { prepareChatSurface(page: Page): Promise<unknown> };
+
+  await expect(worker.prepareChatSurface(page)).rejects.toMatchObject({
+    name: "ChatGptWebAdapterError", status, code, retryable,
   });
 });
 

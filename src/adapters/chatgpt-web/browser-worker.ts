@@ -51,9 +51,11 @@ import {
   assertAuthenticatedChatGptPage,
   assertNewChatPage,
   chatGptNewChatUrl,
+  chatGptBoundAssistantSelector,
   CHATGPT_ASSISTANT_TURN_SELECTOR,
   CHATGPT_COMPLETION_ACTION_SELECTOR,
   CHATGPT_COMPOSER_SELECTOR,
+  CHATGPT_SEND_BUTTON_SELECTOR,
   CHATGPT_EFFORT_CONTROL_SELECTOR,
   CHATGPT_EFFORT_ITEM_SELECTOR,
   CHATGPT_EFFORT_SLIDER_CONTAINER_SELECTOR,
@@ -158,6 +160,10 @@ const CHATGPT_DOM_REVISION_ATTRIBUTES = [
   "data-turn",
   "data-turn-id",
   "data-turn-id-container",
+  "data-turn-key",
+  "data-conversation-role",
+  "data-user-message-bubble",
+  "data-markdown-text-style",
   "disabled",
   "hidden",
   "inert",
@@ -196,8 +202,10 @@ function chatGptConnectorUnavailableError(message: string): ChatGptWebAdapterErr
 
 const CHATGPT_MODEL_CONTROL_UNAVAILABLE_MESSAGE = "ChatGPT model controls are unavailable. Reload ChatGPT and retry the task.";
 
-function chatGptModelControlUnavailableError(diagnostic: string): Error {
-  return new Error(CHATGPT_MODEL_CONTROL_UNAVAILABLE_MESSAGE, { cause: new Error(diagnostic) });
+function chatGptModelControlUnavailableError(diagnostic: string): ChatGptWebAdapterError {
+  // Preserve local UI failure semantics across the helper boundary. A plain Error
+  // containing "unavailable" is otherwise inferred as 503/model capacity by Codex.
+  return chatGptModelControlUnavailableAdapterError(diagnostic);
 }
 
 function chatGptModelControlUnavailableAdapterError(diagnostic: string, detail?: string): ChatGptWebAdapterError {
@@ -565,10 +573,10 @@ async function ensureChatGptPersonalizedConnectorAccessWithinDeadline(
   // The visible sheet can be aria-hidden during hydration. Include those controls in the role
   // query but still require visibility; never select a hidden duplicate or switch locator rules.
   const personalized = page
-    .getByRole("button", { name: /^(?:Personalized|个性化)$/, exact: true, includeHidden: true })
+    .getByRole("button", { name: /^(?:Personalized|Personalizado|个性化)$/, exact: true, includeHidden: true })
     .filter({ visible: true });
   const unpersonalized = page
-    .getByRole("button", { name: /^(?:Unpersonalized|非个性化)$/, exact: true, includeHidden: true })
+    .getByRole("button", { name: /^(?:Unpersonalized|Não personalizado|非个性化)$/, exact: true, includeHidden: true })
     .filter({ visible: true });
   let personalizedCount = await runChatGptPersonalizationStep(() => personalized.count(), deadline, abortSignal);
   let unpersonalizedCount = await runChatGptPersonalizationStep(() => unpersonalized.count(), deadline, abortSignal);
@@ -643,7 +651,7 @@ async function ensureChatGptPersonalizedConnectorAccessWithinDeadline(
     );
     const choice = menu
       .locator(CHATGPT_PERSONALIZATION_CHOICE_SELECTOR)
-      .filter({ hasText: /^(?:Personalized|个性化)/ });
+      .filter({ hasText: /^(?:Personalized|Personalizado|个性化)/ });
     if (await runChatGptPersonalizationStep(() => choice.count(), deadline, abortSignal) !== 1) {
       throw chatGptConnectorUnavailableError(
         "ChatGPT personalization menu did not expose one exact Personalized choice",
@@ -1401,8 +1409,8 @@ export async function setChatGptThinkMode(
     const composer = composerForm.locator(CHATGPT_COMPOSER_SELECTOR).filter({ visible: true }).first();
     const composerState = () => composer.evaluate(element => {
       const copy = element.cloneNode(true) as HTMLElement;
-      const pills = [...copy.querySelectorAll('[data-id^="plugin:"][data-keyword]')];
-      const connectors = pills.map(pill => pill.getAttribute("data-keyword")).sort();
+      const pills = [...copy.querySelectorAll('[data-id^="plugin:"][data-keyword], [app-mention-path^="app://"][app-mention-display-name][contenteditable="false"]')];
+      const connectors = pills.map(pill => pill.getAttribute("data-keyword") ?? pill.getAttribute("app-mention-display-name")).sort();
       for (const pill of pills) pill.remove();
       const text = element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement
         ? element.value : copy.textContent ?? "";
@@ -1899,7 +1907,7 @@ class ChatGptBrowserDiagnostics {
           const composers = [...document.querySelectorAll(composerSelector)].filter(rendered);
           const assistantTurns = [...document.querySelectorAll(assistantTurnSelector)].filter(rendered);
           const selectedConnectors = composers.flatMap(composer => (
-            [...composer.querySelectorAll('[data-id^="plugin:"][data-keyword]')]
+            [...composer.querySelectorAll('[data-id^="plugin:"][data-keyword], [app-mention-path^="app://"][app-mention-display-name][contenteditable="false"]')]
           ))
             .filter(rendered);
           const exactConnectorRows = [...document.querySelectorAll('.__menu-item[tabindex="0"]')]
@@ -1935,7 +1943,7 @@ class ChatGptBrowserDiagnostics {
               })),
               selectedConnectorCount: selectedConnectors.length,
               exactSelectedConnectorCount: selectedConnectors.filter(
-                element => element.getAttribute("data-keyword") === appName,
+                element => (element.getAttribute("data-keyword") ?? element.getAttribute("app-mention-display-name")) === appName,
               ).length,
             },
             focus: {
@@ -2717,9 +2725,16 @@ export class ChatGptBrowserWorker {
     }
     let composer: Locator;
     try {
-      composer = await this.activeComposer(page);
-    } catch {
-      throw new Error("ChatGPT web login is expired or the new chat surface is unavailable");
+      // New Chat can hydrate slowly when several browser turns are active.
+      composer = await this.activeComposer(page, 60_000);
+    } catch (cause) {
+      // A missing composer does not prove that the login expired. Keep an actual
+      // session alert authoritative, then report a retryable pre-submission UI failure.
+      await throwIfChatGptSessionFailureAlert(page);
+      throw new ChatGptWebAdapterError(
+        "ChatGPT did not make the new chat composer available. Reload ChatGPT and retry the task.",
+        { status: 502, errorType: "server_error", code: "chatgpt_surface_unavailable", retryable: true, cause },
+      );
     }
     if (!useSavedChats && await dismissChatGptTemporaryChatOnboarding(page)) {
       await captureDiagnostic?.("temporary-chat-onboarding-dismissed");
@@ -2894,9 +2909,23 @@ export class ChatGptBrowserWorker {
       const containers = [...document.querySelectorAll("[data-turn-id-container]")].filter(element =>
         element.parentElement?.closest("[data-turn-id-container]")?.getAttribute("data-turn-id-container")
           !== element.getAttribute("data-turn-id-container"));
-      const turnIdentities = identities(containers, "data-turn-id-container");
-      const userIdentities = identities([...document.querySelectorAll(options.userTurnSelector)], "data-turn-id");
-      const responseIdentities = identities([...document.querySelectorAll(options.assistantTurnSelector)], "data-turn-id");
+      // The current renderer has one persistent UUID container for a user/assistant pair.
+      // Record both roles in the baseline even while its inner content is virtualized,
+      // so rehydrating history cannot masquerade as a new answer.
+      const pairedKeys = identities([...document.querySelectorAll("[data-turn-key]")], "data-turn-key");
+      const turnIdentities = [
+        ...identities(containers, "data-turn-id-container"),
+        ...pairedKeys.flatMap(key => [`paired:user:${key}`, `paired:assistant:${key}`]),
+      ];
+      const roleIdentities = (selector: string, role: string): string[] => {
+        const elements = [...document.querySelectorAll(selector)];
+        const legacy = elements.filter(element => !element.hasAttribute("data-turn-key"));
+        const paired = elements.filter(element => element.hasAttribute("data-turn-key"));
+        return [...identities(legacy, "data-turn-id"),
+          ...identities(paired, "data-turn-key").map(key => `paired:${role}:${key}`)];
+      };
+      const userIdentities = roleIdentities(options.userTurnSelector, "user");
+      const responseIdentities = roleIdentities(options.assistantTurnSelector, "assistant");
       const knownTurns = new Set(turnIdentities);
       if ([...userIdentities, ...responseIdentities].some(identity => !knownTurns.has(identity))) {
         throw new Error("ChatGPT conversation turn has no matching identity container");
@@ -2956,7 +2985,7 @@ export class ChatGptBrowserWorker {
       state.responseIdentities,
     );
     if (!identity) return "";
-    const locator = page.locator(`[data-turn-id=${JSON.stringify(identity)}]`);
+    const locator = page.locator(chatGptBoundAssistantSelector(identity));
     return (await this.responseDomSnapshot(locator, {})).visibleText;
   }
 
@@ -3055,7 +3084,7 @@ export class ChatGptBrowserWorker {
         && completionTracker?.needsToolBatchObservation(progress.lastToolBatchRevision)) {
         const boundaryText = identity
           ? (await this.responseDomSnapshot(
-            observationPage.locator(`[data-turn-id=${JSON.stringify(identity)}]`),
+            observationPage.locator(chatGptBoundAssistantSelector(identity)),
             {},
           )).visibleText
           : "";
@@ -3064,7 +3093,7 @@ export class ChatGptBrowserWorker {
       }
       if (identity) return {
         identity,
-        locator: observationPage.locator(`[data-turn-id=${JSON.stringify(identity)}]`),
+        locator: observationPage.locator(chatGptBoundAssistantSelector(identity)),
         acceptedTurnIdentities: state.turnIdentities,
       };
       // A delayed renderer wake can cross the grace while the assistant appears. Only a fresh
@@ -3108,7 +3137,7 @@ export class ChatGptBrowserWorker {
     if (!identity || identity === binding.identity) return binding;
     return {
       identity,
-      locator: page.locator(`[data-turn-id=${JSON.stringify(identity)}]`),
+      locator: page.locator(chatGptBoundAssistantSelector(identity)),
       acceptedTurnIdentities: state.turnIdentities,
     };
   }
@@ -3118,7 +3147,7 @@ export class ChatGptBrowserWorker {
     return composer.evaluate(element => {
       const clone = element.cloneNode(true) as HTMLElement;
       clone.querySelectorAll(
-        '[data-id^="plugin:"][data-keyword], [data-inline-selection-pill-cursor-target]',
+        '[data-id^="plugin:"][data-keyword], [app-mention-path^="app://"][app-mention-display-name][contenteditable="false"], [data-inline-selection-pill-cursor-target]',
       )
         .forEach(part => part.remove());
       return [...clone.childNodes]
@@ -3154,7 +3183,7 @@ export class ChatGptBrowserWorker {
 
   private selectedConnectorControl(composer: Locator): Locator {
     return composer
-      .locator(`[data-id^="plugin:"][data-keyword=${JSON.stringify(this.config.appName)}]`)
+      .locator(`[data-id^="plugin:"][data-keyword=${JSON.stringify(this.config.appName)}], [app-mention-path^="app://"][app-mention-display-name=${JSON.stringify(this.config.appName)}][contenteditable="false"]`)
       .filter({ visible: true });
   }
 
@@ -3162,7 +3191,7 @@ export class ChatGptBrowserWorker {
     const selected = this.selectedConnectorControl(composer);
     const keywords = await withBrowserTurnAbort(
       withChatGptBrowserObservationTimeout(selected.evaluateAll(elements => (
-        elements.map(element => element.getAttribute("data-keyword"))
+        elements.map(element => element.getAttribute("data-keyword") ?? element.getAttribute("app-mention-display-name"))
       ))),
       abortSignal,
     );
@@ -3263,7 +3292,7 @@ export class ChatGptBrowserWorker {
       throwIfPromptAttachmentAborted(abortSignal);
     };
     let composer: Locator;
-    const menuRows = page.locator('.__menu-item[tabindex="0"]');
+    const menuRows = page.locator('.__menu-item[tabindex="0"], button[data-list-navigation-item="true"]');
     const appResult = menuRows.filter({
       has: page.getByText(this.config.appName, { exact: true }),
     });
@@ -3405,10 +3434,13 @@ export class ChatGptBrowserWorker {
       // otherwise move the menu highlight until it does. Keep
       // focus on the composer, activate through the menu's real keyboard owner, then prove the exact
       // selected connector pill below.
-      const rowHighlighted = async () => await appResult.getAttribute("data-highlighted", {
-        signal: abortSignal,
-        timeout: CHATGPT_CONNECTOR_ACTION_TIMEOUT_MS,
-      }) !== null;
+      const rowHighlighted = async () => {
+        const options = { signal: abortSignal, timeout: CHATGPT_CONNECTOR_ACTION_TIMEOUT_MS };
+        // Legacy mention rows mark keyboard ownership with data-highlighted;
+        // the current ProseMirror suggestion list uses aria-current instead.
+        return await appResult.getAttribute("data-highlighted", options) !== null
+          || await appResult.getAttribute("aria-current", options) === "true";
+      };
       if (!await rowHighlighted()) {
         const visibleRowCount = await withBrowserTurnAbort(
           withChatGptBrowserObservationTimeout(menuRows.filter({ visible: true }).count()),
@@ -3580,7 +3612,7 @@ export class ChatGptBrowserWorker {
     const composer = await this.activeComposer(page);
     const sendButton = composer
       .locator("xpath=ancestor::form[1]")
-      .getByTestId("send-button");
+      .locator(CHATGPT_SEND_BUTTON_SELECTOR);
     await sendButton.waitFor({ state: "visible", timeout: browserStageTimeouts.send });
     await settleChatGptUi();
     const sendEnableDeadline = Date.now() + CHATGPT_SEND_ENABLE_GRACE_MS;
@@ -3923,7 +3955,7 @@ export class ChatGptBrowserWorker {
         + (alerts.length > 0 ? `: ${alerts.join(" | ")}` : ""),
       );
     }
-    const send = composerForm.getByTestId("send-button");
+    const send = composerForm.locator(CHATGPT_SEND_BUTTON_SELECTOR);
     const deadline = Date.now() + 60_000;
     while (Date.now() < deadline) {
       if (await send.isEnabled().catch(() => false)) return;
@@ -4005,7 +4037,9 @@ export class ChatGptBrowserWorker {
       // ChatGPT's DIL renderer has no .markdown class (#538). Read its response root within the
       // assistant-owned PUIK container; the CSS module hash is build-specific. Both renderers
       // feed the same content serializer and completion checks below, without reading UI text.
-      const answerRootSelector = '.markdown, [data-message-author-role="assistant"] .puik-root.not-markdown > [class*="_DilResponseRoot"]';
+      const answerRootSelector = root.hasAttribute("data-turn-key")
+        ? '[data-markdown-text-style="assistant-message"]'
+        : '.markdown, [data-message-author-role="assistant"] .puik-root.not-markdown > [class*="_DilResponseRoot"]';
       // ChatGPT uses the same content renderer for intermediate commentary and for the final
       // answer. Older responses nested commentary in the streaming-status container. Pro can also
       // render a completed commentary Markdown root immediately before that live status container.
@@ -4359,7 +4393,7 @@ export class ChatGptBrowserWorker {
         const isStoppedLabel = (value: string | null): boolean => labels.has(value?.replace(/\s+/g, " ").trim() ?? "");
         const isStatus = (candidate: HTMLElement): boolean => {
           if (overlapsRenderedAnswer(candidate) || overlapsCommentary(candidate)
-            || candidate.closest("pre, code, blockquote")) return false;
+            || candidate.closest("pre, code, blockquote, [data-user-message-bubble]")) return false;
           for (let element: HTMLElement | null = candidate; element; element = element.parentElement) {
             if (!renderedInDom(element)) return false;
           }
@@ -5196,7 +5230,7 @@ export class ChatGptBrowserWorker {
             };
             responseTurn = {
               ...responseTurn,
-              locator: page.locator(`[data-turn-id=${JSON.stringify(responseTurn.identity)}]`),
+              locator: page.locator(chatGptBoundAssistantSelector(responseTurn.identity)),
             };
             responseDomCache.key = undefined;
             responseDomCache.snapshot = undefined;

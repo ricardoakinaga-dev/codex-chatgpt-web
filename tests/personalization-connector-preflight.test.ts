@@ -7,6 +7,7 @@ function matchesName(name: string | RegExp, label: string): boolean {
 
 const personalizationLabels = [
   { personalized: "Personalized", unpersonalized: "Unpersonalized" },
+  { personalized: "Personalizado", unpersonalized: "Não personalizado" },
   { personalized: "个性化", unpersonalized: "非个性化" },
 ];
 

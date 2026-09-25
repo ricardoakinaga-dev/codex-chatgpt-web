@@ -16,6 +16,7 @@ export const CHATGPT_COMPOSER_SELECTOR = [
 export const CHATGPT_EFFORT_CONTROL_SELECTOR = [
   'button[aria-haspopup="menu"][data-tone="neutral"]',
   'button[data-testid="model-switcher-dropdown-button"][aria-haspopup="menu"]',
+  'button[data-composer-navigation-target="reasoning"][aria-haspopup="menu"]',
 ].join(", ");
 export const CHATGPT_EFFORT_MENU_SELECTOR = [
   '[data-testid="composer-intelligence-picker-content"]:has([role="menuitemradio"], [data-model-reasoning-effort-slider])',
@@ -23,21 +24,34 @@ export const CHATGPT_EFFORT_MENU_SELECTOR = [
   '[role="group"]:has([role="menuitemradio"], [data-model-reasoning-effort-slider])',
 ].join(", ");
 export const CHATGPT_EFFORT_ITEM_SELECTOR = '[role="menuitemradio"]';
-export const CHATGPT_EFFORT_SLIDER_CONTAINER_SELECTOR = '[data-model-reasoning-effort-slider]';
-export const CHATGPT_EFFORT_SLIDER_SELECTOR = '[data-model-reasoning-effort-slider] [role="slider"]';
+export const CHATGPT_EFFORT_SLIDER_CONTAINER_SELECTOR = '[data-model-reasoning-effort-slider], [data-model-picker-power-slider]';
+export const CHATGPT_EFFORT_SLIDER_SELECTOR = '[data-model-reasoning-effort-slider] [role="slider"], [data-model-picker-power-slider] [role="slider"]';
 export const CHATGPT_EFFORT_SLIDER_MAX_OPTIONS = 5;
-export const CHATGPT_STOP_BUTTON_SELECTOR = '[data-testid="stop-button"]';
-export const CHATGPT_COMPLETION_ACTION_SELECTOR = 'button[data-testid="copy-turn-action-button"]';
+export const CHATGPT_SEND_BUTTON_SELECTOR = '[data-testid="send-button"], button[type="submit"]';
+export const CHATGPT_STOP_BUTTON_SELECTOR = '[data-testid="stop-button"], form:has([data-composer-markdown]) button[aria-label="Parar"], form:has([data-composer-markdown]) button[aria-label="Stop"]';
+export const CHATGPT_COMPLETION_ACTION_SELECTOR = 'button[data-testid="copy-turn-action-button"], [data-turn-key] button[aria-label="Copiar"], [data-turn-key] button[aria-label="Copy"]';
 export const CHATGPT_ASSISTANT_TURN_SELECTOR = [
   '[data-testid^="conversation-turn-"][data-turn="assistant"]',
   '[data-testid^="conversation-turn-"][data-message-author-role="assistant"]',
   '[data-testid^="conversation-turn-"]:has([data-message-author-role="assistant"])',
+  '[data-turn-key]:has([data-conversation-role="assistant"])',
+  // The paired container exists before answer text, while Pro is still thinking.
+  // Bind its stable identity early; the stop control and completion action govern readiness.
+  '[data-turn-key]:has([data-user-message-bubble])',
 ].join(", ");
 export const CHATGPT_USER_TURN_SELECTOR = [
   '[data-testid^="conversation-turn-"][data-turn="user"]',
   '[data-testid^="conversation-turn-"][data-message-author-role="user"]',
   '[data-testid^="conversation-turn-"]:has([data-message-author-role="user"])',
+  '[data-turn-key]:has([data-user-message-bubble])',
 ].join(", ");
+
+export function chatGptBoundAssistantSelector(identity: string): string {
+  const prefix = "paired:assistant:";
+  return identity.startsWith(prefix)
+    ? `[data-turn-key=${JSON.stringify(identity.slice(prefix.length))}]`
+    : `[data-turn-id=${JSON.stringify(identity)}]`;
+}
 
 export interface ChatGptEffortSliderState {
   min: number;
@@ -163,10 +177,18 @@ export async function readChatGptEffortAvailability(
 ): Promise<boolean[]> {
   // Plus exposes a fourth ARIA position for a locked Pro upsell. Only the ticks
   // carry both attributes; the slider root also has data-locked and is not a choice.
-  const locks = await sliderContainer.evaluate(container => Array.from(
-    container.querySelectorAll("[data-locked][data-selected]"),
-    tick => tick.getAttribute("data-locked"),
-  ));
+  const locks = await sliderContainer.evaluate(container => {
+    if (container.hasAttribute("data-model-picker-power-slider")) {
+      // The new power picker has an enabled ARIA range and plain selected ticks.
+      // Keep any explicit lock authoritative; reject a disabled/unknown root.
+      if (container.querySelector('[data-orientation="horizontal"][aria-disabled]')
+        ?.getAttribute("aria-disabled") !== "false") return [];
+      return Array.from(container.querySelectorAll("[data-selected]"), tick =>
+        tick.getAttribute("data-locked") ?? "false");
+    }
+    return Array.from(container.querySelectorAll("[data-locked][data-selected]"),
+      tick => tick.getAttribute("data-locked"));
+  });
   if (locks.length !== state.max - state.min + 1
     || locks.some(lock => lock !== "true" && lock !== "false")) {
     throw new Error("ChatGPT effort availability could not be verified from its slider ticks");

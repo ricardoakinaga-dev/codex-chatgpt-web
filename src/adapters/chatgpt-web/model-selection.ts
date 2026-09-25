@@ -15,8 +15,8 @@ function familyError(family: ChatGptWebModelFamily, cause?: unknown): ChatGptWeb
 function familyOption(menu: EffortMenu, family: ChatGptWebModelFamily) {
   return menu.menu.getByRole("menuitemradio", {
     name: family === "5.6" ? /^GPT[-\s]?5\.6\s+Sol(?:\s+Pro)?$/i
-      // Simplified/Traditional Chinese and Japanese share 最新; Korean uses 최신.
-      : /^(?:Latest|最新|최신|GPT[-\s]?6(?:\s+Astra)?(?:\s+Pro)?)$/i,
+      // pt-BR uses Recente; Simplified/Traditional Chinese and Japanese share 最新.
+      : /^(?:Latest|Recente|最新|최신|GPT[-\s]?6(?:\s+Astra)?(?:\s+Pro)?)$/i,
     exact: true,
     includeHidden: true,
   });

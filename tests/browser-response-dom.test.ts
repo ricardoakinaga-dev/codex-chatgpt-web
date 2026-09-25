@@ -12,6 +12,7 @@ type Snapshot = {
   fullHtml: string;
   markdownSegments: ChatGptMarkdownSegment[];
   completionActionVisible: boolean;
+  stoppedThinkingVisible: boolean;
   traceBlocks: { kind: string; text: string }[];
 };
 
@@ -121,4 +122,20 @@ test("DIL response extraction preserves ownership, commentary and completion bou
   const noCopy = await snapshot(smokeHtml.replace('data-testid="copy-turn-action-button"', 'data-testid="other-action"'));
   expect(noCopy.visibleText).toBe("CODEX WEB GPT READY");
   expect(noCopy.completionActionVisible).toBeFalse();
+});
+
+test("paired turns read only assistant Markdown and require an external completion control", async () => {
+  const content = `<div id="turn" data-turn-key="pair-1">
+    <div data-user-message-bubble="true"><div data-markdown-text-tone="user-message">SECRET USER PROMPT<p>Stopped thinking</p></div><button aria-label="Copiar mensagem"></button></div>
+    <div data-markdown-text-style="assistant-message"><p>OK</p><pre><code>example</code><button aria-label="Copiar"></button></pre></div>
+    FOOTER
+  </div>`;
+  const pending = await snapshot(content);
+  expect(pending.visibleText).not.toContain("SECRET USER PROMPT");
+  expect(pending.visibleText).not.toContain("FOOTER");
+  expect(pending.completionActionVisible).toBeFalse();
+  expect(pending.stoppedThinkingVisible).toBeFalse();
+  const completed = await snapshot(content.replace("FOOTER", '<button aria-label="Copiar"></button>'));
+  expect(completed.completionActionVisible).toBeTrue();
+  expect(completed.fullHtml).not.toContain("SECRET USER PROMPT");
 });

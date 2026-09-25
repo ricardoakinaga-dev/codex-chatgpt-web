@@ -9,6 +9,7 @@ import {
   assertNewChatPage,
   chatGptNewChatUrl,
   detectChatGptAccountCapabilities,
+  readChatGptEffortAvailability,
 } from "../src/chatgpt-session";
 
 test("saved chats start empty and cannot reuse an arbitrary conversation or a Temporary Chat", async () => {
@@ -47,10 +48,12 @@ test("composer and effort selectors exclude unrelated editable fields and menu b
     <div contenteditable="true" role="textbox" id="unrelated-textbox"></div>
     <button aria-haspopup="menu" data-tone="neutral" id="effort"></button>
     <button aria-haspopup="menu" data-testid="model-switcher-dropdown-button" id="model"></button>
+    <button aria-haspopup="menu" data-composer-navigation-target="reasoning" id="reasoning"></button>
+    <button aria-haspopup="menu" data-composer-navigation-target="add-context" id="context"></button>
   </form></body>`);
   const matches = (selector: string) => Array.from(document.querySelectorAll(selector)).map(element => element.id);
   expect(matches(CHATGPT_COMPOSER_SELECTOR)).toEqual(["composer-testid", "prompt-textarea", "composer-lexical", "composer-markdown"]);
-  expect(matches(CHATGPT_EFFORT_CONTROL_SELECTOR)).toEqual(["effort", "model"]);
+  expect(matches(CHATGPT_EFFORT_CONTROL_SELECTOR)).toEqual(["effort", "model", "reasoning"]);
 });
 
 test("effort activation binds the owned menu after the control opens", async () => {
@@ -354,6 +357,40 @@ test("stale saved capabilities cannot activate a locked effort; High remains sel
       expect(fixture.keys).toEqual(["ArrowRight", "ArrowRight"]);
     }
   }
+});
+
+test("new power picker reads its enabled range without discarding explicit locks", async () => {
+  const { createDocument } = require("@mixmark-io/domino") as { createDocument(html: string): Document };
+  for (const [enabled, ticks, expected] of [
+    ["false", '<span data-selected="true"></span>'.repeat(5), [true, true, true, true, true]],
+    ["false", '<span data-selected="true"></span>'.repeat(4) + '<span data-selected="false" data-locked="true"></span>', [true, true, true, true, false]],
+    ["true", '<span data-selected="true"></span>'.repeat(5), null],
+    ["unknown", '<span data-selected="true"></span>'.repeat(5), null],
+    ["false", '<span data-selected="true"></span>'.repeat(4), null],
+    ["false", '<span data-selected="true"></span>'.repeat(4) + '<span data-selected="false" data-locked="unknown"></span>', null],
+  ] as const) {
+    const document = createDocument(`<div data-model-picker-power-slider><span data-orientation="horizontal" aria-disabled="${enabled}">${ticks}</span><span role="slider"></span></div>`);
+    const element = document.querySelector("[data-model-picker-power-slider]")!;
+    expect(document.querySelector(CHATGPT_EFFORT_SLIDER_CONTAINER_SELECTOR)).toBe(element);
+    const container = { evaluate: async (read: (element: Element) => unknown) => read(element) };
+    const result = readChatGptEffortAvailability(container as never, { min: 0, max: 4, value: 4 });
+    if (expected) await expect(result).resolves.toEqual([...expected]);
+    else await expect(result).rejects.toThrow("availability");
+  }
+});
+
+test("missing model controls remain a typed UI error rather than inferred model capacity", async () => {
+  const fixture = reasoningPicker({});
+  fixture.composer.locator().locator().waitFor = async () => { throw new Error("control missing"); };
+  const worker = Object.assign(Object.create(ChatGptBrowserWorker.prototype), {
+    activeComposer: async () => fixture.composer,
+  }) as { selectModelAndEffort(...args: unknown[]): Promise<unknown> };
+  await expect(worker.selectModelAndEffort(fixture.page, "gpt-5.6-sol", "max", {
+    localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true,
+  })).rejects.toMatchObject({
+    name: "ChatGptWebAdapterError", status: 502, errorType: "server_error",
+    code: "upstream_server_error", retryable: false,
+  });
 });
 
 test("Pro selection verifies the persisted hidden slider through its visible owner, never model rows", async () => {
