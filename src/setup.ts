@@ -324,6 +324,27 @@ function baseConfig(
   return config;
 }
 
+/**
+ * Luna keeps one 28,000-token browser transport budget for every later request, so Bigger Context
+ * cannot ever stage a multipart turn for a Luna-only account. Fail an explicit enablement request
+ * with a clear reason; a stale saved setting is repaired to off instead of blocking setup.
+ */
+function applyBiggerContextAccountSupport(config: AppConfig, options: SetupOptions): void {
+  if (config.browserInteractionMode === "manual"
+    || config.experimentalBiggerContext !== true
+    || config.solAvailable) {
+    return;
+  }
+  if (options.experimentalBiggerContext === true) {
+    throw new Error(
+      "Bigger Context requires a Sol-capable ChatGPT account. This account exposes only Luna, "
+      + "whose browser transport keeps the 28,000-token budget. Disable Bigger Context or sign in "
+      + "with a Sol-capable account.",
+    );
+  }
+  config.experimentalBiggerContext = false;
+}
+
 async function inspectLauncherCapabilities(
   config: AppConfig,
   existing: AppConfig | undefined,
@@ -567,6 +588,7 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
   config.solAvailable = solAvailable === true;
   config.extraHighAvailable = config.solAvailable && extraHighAvailable === true;
   config.proAvailable = config.solAvailable && proAvailable === true;
+  applyBiggerContextAccountSupport(config, options);
   const explicitTunnelChange = Boolean(options.tunnelId || options.runtimeKeyFile || options.runtimeKeyValue);
   const preliminaryChange = Boolean(existing && (meaningfulRuntimeChange(existing, config) || explicitTunnelChange || options.forceLogin));
   if (beforeService.loaded && preliminaryChange && !options.restartService) {
@@ -678,6 +700,7 @@ export async function setupDevProfile(options: SetupOptions): Promise<DevProfile
     config.solAvailable = capabilities.solAvailable;
     config.extraHighAvailable = capabilities.solAvailable && capabilities.extraHighAvailable;
     config.proAvailable = capabilities.solAvailable && capabilities.proAvailable;
+    applyBiggerContextAccountSupport(config, options);
   }
 
   await configureTunnel(config, existing, options);

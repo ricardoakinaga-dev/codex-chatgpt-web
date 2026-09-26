@@ -709,6 +709,7 @@ export function createChatGptWebAdapter(
         onReasoningSummary: (text, continuation) => trace.push({ kind: "reasoning", text, ...(continuation ? { continuation: true } : {}) }),
         onCommentary: (text, continuation) => trace.push({ kind: "commentary", text, ...(continuation ? { continuation: true } : {}) }),
         onTextDelta: delta => text.push(delta),
+        onTextReset: value => text.reset(value),
         ...(captureLunaCheckpoint ? {
           captureLunaCheckpoint: true,
           onLunaCheckpoint: captureCheckpoint,
@@ -774,6 +775,7 @@ export function createChatGptWebAdapter(
       onReasoningSummary: (text, continuation) => trace.push({ kind: "reasoning", text, ...(continuation ? { continuation: true } : {}) }),
       onCommentary: (text, continuation) => trace.push({ kind: "commentary", text, ...(continuation ? { continuation: true } : {}) }),
       onTextDelta: delta => text.push(delta),
+      onTextReset: value => text.reset(value),
       externalProgress,
       completionFence: {
         begin: async () => broker.beginCompletionFence(await token.promise),
@@ -1198,9 +1200,11 @@ export function createChatGptWebAdapter(
               if (settled.type === "error") throw settled.error;
               const trace = session.runtime.trace.drain();
               const completedTextDeltas = session.runtime.text.drain();
+              const completedTextReset = session.runtime.text.takeReset();
               const finalReplay = replay.length === 0
                 && trace.length === 0
                 && completedTextDeltas.length === 0
+                && completedTextReset === undefined
                 ? session.eventsForFinalReplay()
                 : [];
               if (finalReplay.length > 0) {
@@ -1214,6 +1218,9 @@ export function createChatGptWebAdapter(
                 emitRoundBatch(buffer => emitTraceEvents(trace, buffer));
                 if (!bufferStructuredOutput) {
                   emitRoundBatch(buffer => emitTextDeltas(completedTextDeltas, buffer));
+                  if (completedTextReset !== undefined) {
+                    emitRoundBatch(buffer => buffer({ type: "text_reset", text: completedTextReset }));
+                  }
                 }
               }
               if (session.runtime.text.value() !== settled.answer) {
@@ -1278,7 +1285,12 @@ export function createChatGptWebAdapter(
                 emitRoundBatch(buffer => emitTraceEvents(trace, buffer));
               };
               const emitNewText = (deltas: string[]) => {
-                if (!bufferStructuredOutput) emitRoundBatch(buffer => emitTextDeltas(deltas, buffer));
+                if (bufferStructuredOutput) return;
+                emitRoundBatch(buffer => emitTextDeltas(deltas, buffer));
+                const reset = session.runtime.text.takeReset();
+                if (reset !== undefined) {
+                  emitRoundBatch(buffer => buffer({ type: "text_reset", text: reset }));
+                }
               };
               if (replay.length === 0 && !parsed._compactionRequest) {
                 emitRoundBatch(buffer => emitReadOnlyContextWarning(parsed, turnCapabilities, buffer));

@@ -532,10 +532,53 @@ function resolveRouteEffort(
   reasoning?: string,
 ): ChatGptWebAutomaticModelRoute {
   if (!route.supportedCodexEfforts) return route;
-  const effort = reasoning ?? route.codexEffort;
-  if (!chatGptWebRouteEfforts(route, capabilities).includes(effort as ChatGptWebCodexEffort)) {
-    throw new Error(`${route.displayName} does not support effort ${JSON.stringify(effort)} for this account`);
+  const requested = reasoning ?? route.codexEffort;
+  const supported = chatGptWebRouteEfforts(route, capabilities);
+  if (supported.includes(requested as ChatGptWebCodexEffort)) {
+    if (requested === route.codexEffort) return route;
+    return { ...route, codexEffort: requested as ChatGptWebCodexEffort, adapterEffort: requested as ChatGptWebAdapterEffort };
   }
-  if (effort === route.codexEffort) return route;
-  return { ...route, codexEffort: effort as ChatGptWebCodexEffort, adapterEffort: effort as ChatGptWebAdapterEffort };
+  // A Codex-global effort (model_reasoning_effort) must not block a route that only supports a
+  // nearby level: normalize to the closest supported effort and report the substitution. An
+  // unknown effort string is not a Codex level and still fails closed.
+  const normalized = nearestChatGptWebRouteEffort(supported, requested);
+  if (!normalized) {
+    throw new Error(
+      `${route.displayName} does not support effort ${JSON.stringify(requested)} for this account. `
+      + "Change model_reasoning_effort in ~/.codex/config.toml or select a model that supports this effort.",
+    );
+  }
+  if (normalized !== requested) {
+    console.warn(
+      `[chatgpt-web] effort ${JSON.stringify(requested)} is not supported by ${route.displayName} for this account; using ${JSON.stringify(normalized)}`,
+    );
+  }
+  if (normalized === route.codexEffort) return route;
+  return { ...route, codexEffort: normalized, adapterEffort: normalized as ChatGptWebAdapterEffort };
+}
+
+const CHATGPT_WEB_CODEX_EFFORT_RANK: Record<string, number> = {
+  none: -2,
+  minimal: -1,
+  low: 0,
+  medium: 1,
+  high: 2,
+  xhigh: 3,
+  max: 4,
+  ultra: 5,
+};
+
+function nearestChatGptWebRouteEffort(
+  supported: readonly ChatGptWebCodexEffort[],
+  requested: string,
+): ChatGptWebCodexEffort | undefined {
+  const requestedRank = CHATGPT_WEB_CODEX_EFFORT_RANK[requested];
+  if (requestedRank === undefined || supported.length === 0) return undefined;
+  return supported.reduce((best, candidate) => {
+    const bestDistance = Math.abs(CHATGPT_WEB_CODEX_EFFORT_RANK[best]! - requestedRank);
+    const candidateDistance = Math.abs(CHATGPT_WEB_CODEX_EFFORT_RANK[candidate]! - requestedRank);
+    if (candidateDistance < bestDistance) return candidate;
+    if (candidateDistance > bestDistance) return best;
+    return CHATGPT_WEB_CODEX_EFFORT_RANK[candidate]! > CHATGPT_WEB_CODEX_EFFORT_RANK[best]! ? candidate : best;
+  });
 }

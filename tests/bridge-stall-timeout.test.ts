@@ -67,6 +67,49 @@ test("an adapter that keeps heartbeating is never cancelled, however long it tak
   expect(body).toContain("event: response.completed");
 });
 
+test("a client that stops reading long enough cancels the abandoned turn", async () => {
+  let cancelled = false;
+  async function* silent(): AsyncGenerator<AdapterEvent> {
+    await new Promise<void>(() => {});
+  }
+  const stream = bridgeToResponsesSSE(
+    silent(),
+    "chatgpt-web/test",
+    undefined,
+    undefined,
+    undefined,
+    () => { cancelled = true; },
+    5,
+    { streamPlatform: "darwin", clientReadTimeoutMs: 20 },
+  );
+  // Never read from the stream: response.created fills the queue, so desiredSize stays <= 0.
+  await sleep(80);
+  expect(cancelled).toBe(true);
+  await stream.cancel().catch(() => {});
+});
+
+test("a client that keeps reading is never cancelled by the read budget", async () => {
+  async function* beats(): AsyncGenerator<AdapterEvent> {
+    for (let beat = 0; beat < 12; beat++) {
+      await sleep(25);
+      yield { type: "heartbeat" };
+    }
+    yield { type: "done", endTurn: true };
+  }
+  const body = await new Response(bridgeToResponsesSSE(
+    beats(),
+    "chatgpt-web/test",
+    undefined,
+    undefined,
+    undefined,
+    () => {},
+    10,
+    { streamPlatform: "darwin", clientReadTimeoutMs: 300 },
+  )).text();
+  // A live reader reaches the terminal event; the read budget must not preempt it.
+  expect(body).toContain("event: response.completed");
+});
+
 test("the stall budget is configurable and falls back to the shipped default", () => {
   expect(resolveStallTimeoutSec(undefined)).toBe(DEFAULT_STALL_TIMEOUT_SEC);
   expect(resolveStallTimeoutSec(Number.NaN)).toBe(DEFAULT_STALL_TIMEOUT_SEC);

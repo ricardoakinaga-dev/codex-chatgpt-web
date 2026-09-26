@@ -29,7 +29,10 @@ function isAuthenticationMessage(text: string): boolean {
   );
   return (
     text.includes("authentication failed") ||
-    text.includes("authentication") ||
+    text.includes("authentication_error") ||
+    text.includes("authentication expired") ||
+    text.includes("authentication required") ||
+    text.includes("not authenticated") ||
     text.includes("invalid_api_key") ||
     text.includes("invalid api key") ||
     text.includes("invalid token") ||
@@ -86,6 +89,36 @@ export function classifyError(status: number, type: string, message: string): Co
     isClientClosedMessage(text)
   ) {
     return { message, type: "invalid_request_error", code: "client_closed_request" };
+  }
+  // Structured Responses error types are authoritative. Keyword heuristics must not re-label a
+  // deliberate adapter classification (for example an internal "authentication could not be
+  // verified" 502 becoming invalid_api_key, or a local "composer unavailable" becoming capacity).
+  if (type === "rate_limit_error") {
+    return { message, type: "rate_limit_error", code: "rate_limit_exceeded" };
+  }
+  if (type === "authentication_error") {
+    return { message, type: "authentication_error", code: "invalid_api_key" };
+  }
+  if (type === "insufficient_quota") {
+    return { message, type: "insufficient_quota", code: "insufficient_quota" };
+  }
+  if (type === "permission_error") {
+    return {
+      message,
+      type: "permission_error",
+      code: status === 403 && isSubscriptionGateMessage(text) ? "subscription_required" : "permission_denied",
+    };
+  }
+  if (type === "server_error") {
+    const overloaded = status === 503
+      || text.includes("overloaded")
+      || text.includes("server is busy")
+      || text.includes("temporarily unavailable");
+    return {
+      message,
+      type: "server_error",
+      code: overloaded ? "server_is_overloaded" : "upstream_server_error",
+    };
   }
   if (
     text.includes("context_length_exceeded") ||
@@ -174,16 +207,20 @@ export function classifyError(status: number, type: string, message: string): Co
 
 /** Best-effort parse of a retry delay embedded in an upstream error message. */
 export function parseRetryAfterFromMessage(message: string): number | undefined {
-  const patterns = [
-    /try again in (\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?/i,
-    /retry after (\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?/i,
-    /retry[- ]after[:\s]+(\d+)/i,
+  const patterns: Array<{ pattern: RegExp; unitSeconds: number }> = [
+    { pattern: /try again in (\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?/i, unitSeconds: 1 },
+    { pattern: /retry after (\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?/i, unitSeconds: 1 },
+    { pattern: /try again in (\d+(?:\.\d+)?)\s*m(?:in(?:ute)?s?)?/i, unitSeconds: 60 },
+    { pattern: /retry after (\d+(?:\.\d+)?)\s*m(?:in(?:ute)?s?)?/i, unitSeconds: 60 },
+    { pattern: /try again in (\d+(?:\.\d+)?)\s*h(?:our)?s?/i, unitSeconds: 3_600 },
+    { pattern: /retry after (\d+(?:\.\d+)?)\s*h(?:our)?s?/i, unitSeconds: 3_600 },
+    { pattern: /retry[- ]after[:\s]+(\d+)/i, unitSeconds: 1 },
   ];
-  for (const pattern of patterns) {
+  for (const { pattern, unitSeconds } of patterns) {
     const match = message.match(pattern);
     if (!match?.[1]) continue;
-    const seconds = Number.parseFloat(match[1]);
-    if (Number.isFinite(seconds) && seconds > 0) return Math.ceil(seconds);
+    const value = Number.parseFloat(match[1]);
+    if (Number.isFinite(value) && value > 0) return Math.ceil(value * unitSeconds);
   }
   return undefined;
 }
@@ -205,9 +242,8 @@ export function inferHttpStatusFromAdapterMessage(message: string): number {
   if (isAuthenticationMessage(lower)) return 401;
   if (isSubscriptionGateMessage(lower) || isPermissionMessage(lower)) return 403;
   if (
-    lower.includes("unavailable") ||
+    lower.includes("temporarily unavailable") ||
     lower.includes("overloaded") ||
-    lower.includes("temporarily") ||
     lower.includes("server is busy")
   ) return 503;
   if (

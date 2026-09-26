@@ -148,8 +148,27 @@ export async function runDoctor(): Promise<DoctorReport> {
     }
   }
 
-  const codex = inspectCodexIntegration();
-  if (!codex.installed) {
+  let codex: ReturnType<typeof inspectCodexIntegration>;
+  let codexInspectionError: string | undefined;
+  try {
+    codex = inspectCodexIntegration();
+  } catch (error) {
+    // Doctor must report a damaged integration instead of crashing before its other checks run.
+    codexInspectionError = error instanceof Error ? error.message : String(error);
+    codex = {
+      installed: false,
+      active: false,
+      errors: [codexInspectionError],
+    } as ReturnType<typeof inspectCodexIntegration>;
+  }
+  if (codexInspectionError) {
+    checks.push({
+      id: "codex",
+      status: "error",
+      message: "Codex integration could not be inspected",
+      detail: codexInspectionError,
+    });
+  } else if (!codex.installed) {
     checks.push({ id: "codex", status: "error", message: "Codex model route is not installed" });
   } else if (codex.errors.length > 0) {
     checks.push({ id: "codex", status: "error", message: "Codex integration is inconsistent", detail: codex.errors.join("; ") });

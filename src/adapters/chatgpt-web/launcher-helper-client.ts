@@ -25,7 +25,7 @@ interface PendingTurn {
 
 type HelperMessage =
   | { type: "ready"; features?: string[] }
-  | { type: "event"; id: string; event: "heartbeat" | "send_activated" | "submitted" | "reasoning" | "commentary" | "text"; text?: string; continuation?: boolean }
+  | { type: "event"; id: string; event: "heartbeat" | "send_activated" | "submitted" | "reasoning" | "commentary" | "text" | "text_reset"; text?: string; continuation?: boolean }
   | { type: "event"; id: string; event: "tool_batch_observed"; revision: number }
   | { type: "event"; id: string; event: "multipart_stage_acknowledged"; stageIndex: number }
   | { type: "event"; id: string; event: "completion_fence_begin"; requestId: number }
@@ -114,7 +114,7 @@ function parseHelperMessage(line: string): HelperMessage {
       }
       return { type: "event", id: message.id, event, reused: message.reused };
     }
-    if (!["heartbeat", "send_activated", "submitted", "reasoning", "commentary", "text"].includes(String(event))) {
+    if (!["heartbeat", "send_activated", "submitted", "reasoning", "commentary", "text", "text_reset"].includes(String(event))) {
       throw new Error("Launcher browser helper emitted an unknown event");
     }
     if (text !== undefined && typeof text !== "string") {
@@ -557,6 +557,7 @@ export class LauncherBrowserHelperClient {
       }
       else if (message.event === "commentary" && message.text) pending.turn.onCommentary?.(message.text, message.continuation === true);
       else if (message.event === "text" && message.text) pending.turn.onTextDelta(message.text);
+      else if (message.event === "text_reset") pending.turn.onTextReset?.(message.text ?? "");
       return;
     }
     if (message.type === "result") {

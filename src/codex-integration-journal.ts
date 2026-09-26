@@ -42,7 +42,14 @@ function isInstalledInterruptHook(value: unknown): boolean {
 }
 
 function parseJournal(path: string): AnyCodexIntegrationJournal {
-  const value = JSON.parse(stripUtf8Bom(readFileSync(path, "utf8"))) as Record<string, unknown>;
+  let value: Record<string, unknown>;
+  try {
+    value = JSON.parse(stripUtf8Bom(readFileSync(path, "utf8"))) as Record<string, unknown>;
+  } catch (error) {
+    throw new Error(
+      `Invalid Codex integration journal: ${path} (${error instanceof Error ? error.message : String(error)})`,
+    );
+  }
   const installed = value.installed as Record<string, unknown> | undefined;
   if (value.version === 10
     && typeof value.active === "boolean"
@@ -147,6 +154,15 @@ function journalMatchesConfig(journal: AnyCodexIntegrationJournal): boolean {
   }
 }
 
+function journalTargetsActiveConfig(journal: AnyCodexIntegrationJournal): boolean {
+  try {
+    assertJournalTargetsConfig(journal, getCodexConfigPath());
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function readJournal(): AnyCodexIntegrationJournal | undefined {
   const primaryPath = getCodexJournalPath();
   const recoveryPath = getCodexJournalRecoveryPath();
@@ -172,6 +188,13 @@ export function readJournal(): AnyCodexIntegrationJournal | undefined {
   }
   if (recovery && !primary && !primaryError) {
     if (!journalMatchesConfig(recovery)) {
+      if (journalTargetsActiveConfig(recovery)) {
+        // The recovery intent was persisted before its config commit and the config never carried
+        // this baseline (crash window). The physical config is authoritative: the intent is inert,
+        // not a failed install that must wedge setup, doctor, and uninstall behind a hand-deleted
+        // file. A journal aimed at another config path still fails closed.
+        return undefined;
+      }
       throw new Error("Codex integration recovery journal does not match the active config");
     }
     atomicWriteFile(primaryPath, serializeJournal(recovery));

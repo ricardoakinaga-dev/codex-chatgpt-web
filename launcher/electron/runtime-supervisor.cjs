@@ -14,6 +14,10 @@ const { runtimeInvocation } = require("./runtime-command.cjs");
 
 const RESTART_WINDOW_MS = 60_000;
 const MAX_RESTARTS_PER_WINDOW = 5;
+const RECOVERY_COOLDOWN_BASE_MS = 60_000;
+const RECOVERY_COOLDOWN_MAX_MS = 600_000;
+const DAEMON_MONITOR_INTERVAL_MS = 10_000;
+const DAEMON_MONITOR_FAILURE_THRESHOLD = 3;
 const MAX_RUNTIME_LOG_LINE_CHARS = 64 * 1024;
 const MAX_CONTROL_OUTPUT_BYTES = 1024 * 1024;
 const DRAIN_IDLE_TIMEOUT_MS = 15_000;
@@ -358,6 +362,11 @@ class RuntimeSupervisor {
     this.stopPromise = null;
     this.restartHistory = { daemon: [], tunnel: [] };
     this.restartTimers = { daemon: null, tunnel: null };
+    this.recoveryCooldowns = { daemon: 0, tunnel: 0 };
+    this.daemonMonitorTimer = null;
+    this.daemonMonitorInFlight = false;
+    this.daemonMonitorFailures = 0;
+    this.daemonMonitorGeneration = 0;
     this.tunnelMonitorTimer = null;
     this.tunnelMonitorInFlight = false;
     this.tunnelMonitorFailures = 0;
@@ -526,6 +535,7 @@ class RuntimeSupervisor {
       const restartable = this.restartableChildren.has(child);
       this.restartableChildren.delete(child);
       if (this[name] === child) this[name] = null;
+      if (name === "daemon") this.stopDaemonMonitor();
       const detail = error
         ? `${name} failed to start: ${error.message}`
         : `${name} exited (${signal || code})`
@@ -1138,6 +1148,60 @@ class RuntimeSupervisor {
     this.tunnelMonitorGeneration += 1;
   }
 
+  startDaemonMonitor(config) {
+    if (this.launcherProfile === "development") return;
+    this.stopDaemonMonitor();
+    this.daemonMonitorFailures = 0;
+    const generation = this.daemonMonitorGeneration;
+    const recordFailure = (message) => {
+      if (this.stopping || generation !== this.daemonMonitorGeneration) return;
+      this.daemonMonitorFailures += 1;
+      this.logger.warn("runtime.daemon_monitor_unhealthy", {
+        consecutiveFailures: this.daemonMonitorFailures,
+        message,
+      });
+      if (this.daemonMonitorFailures < DAEMON_MONITOR_FAILURE_THRESHOLD) return;
+      this.lastChildFailure.daemon = message;
+      this.stopDaemonMonitor();
+      void this.stopChild("daemon").catch((error) => {
+        this.logger.warn("runtime.daemon_monitor_stop_failed", { message: errorMessage(error) });
+      }).finally(() => {
+        if (!this.tryWriteState("degraded", message)) return;
+        this.publishOperation?.({ name: "runtime-recovery", status: "running", message });
+        this.scheduleRecovery("daemon");
+      });
+    };
+    this.daemonMonitorTimer = setInterval(() => {
+      if (this.stopping
+        || generation !== this.daemonMonitorGeneration
+        || this.daemonMonitorInFlight
+        || this.restartTimers.daemon) return;
+      const child = this.daemon;
+      if (!child) return;
+      this.daemonMonitorInFlight = true;
+      void this.proxyHealth(config, 2_000, child.pid).then((healthy) => {
+        if (this.stopping || generation !== this.daemonMonitorGeneration) return;
+        if (healthy) {
+          this.daemonMonitorFailures = 0;
+          return;
+        }
+        recordFailure("Responses proxy lost its matching health evidence");
+      }).catch((error) => {
+        recordFailure(`Responses proxy health probe failed: ${errorMessage(error)}`);
+      }).finally(() => {
+        this.daemonMonitorInFlight = false;
+      });
+    }, DAEMON_MONITOR_INTERVAL_MS);
+    this.daemonMonitorTimer.unref?.();
+  }
+
+  stopDaemonMonitor() {
+    if (this.daemonMonitorTimer) clearInterval(this.daemonMonitorTimer);
+    this.daemonMonitorTimer = null;
+    this.daemonMonitorFailures = 0;
+    this.daemonMonitorGeneration += 1;
+  }
+
   async startDaemon(config) {
     if (this.daemon) {
       const child = this.daemon;
@@ -1152,6 +1216,7 @@ class RuntimeSupervisor {
       await this.waitForProxy(config);
       if (this.daemon !== child) throw new Error("Responses proxy exited while readiness was being confirmed");
       this.restartableChildren.add(child);
+      this.startDaemonMonitor(config);
       return;
     }
     let child;
@@ -1160,6 +1225,7 @@ class RuntimeSupervisor {
       await this.waitForProxy(config);
       if (this.daemon !== child) throw new Error("Responses proxy exited immediately after becoming healthy");
       this.restartableChildren.add(child);
+      this.startDaemonMonitor(config);
     } catch (error) {
       let cleanupError;
       try {
@@ -1275,6 +1341,7 @@ class RuntimeSupervisor {
       if (!tunnelOnly) await this.startDaemon(config);
       this.restartHistory.daemon = [];
       this.restartHistory.tunnel = [];
+      this.recoveryCooldowns = { daemon: 0, tunnel: 0 };
       this.writeState("ready");
       this.publishOperation?.({
         name: "runtime-start",
@@ -1314,15 +1381,23 @@ class RuntimeSupervisor {
     if (this.stopping) return;
     if (this.restartTimers[name]) return;
     const attempts = this.recordRestart(name);
+    let delay;
     if (attempts > MAX_RESTARTS_PER_WINDOW) {
+      // A crash loop must not disable recovery permanently: that leaves the runtime failed until a
+      // human restarts it. Escalate into a slow, exponentially backed-off retry instead, and reset
+      // the fast-window history so a recovered runtime starts clean.
+      this.restartHistory[name] = [];
+      const cooldowns = (this.recoveryCooldowns[name] ?? 0) + 1;
+      this.recoveryCooldowns[name] = cooldowns;
+      delay = Math.min(RECOVERY_COOLDOWN_BASE_MS * 2 ** (cooldowns - 1), RECOVERY_COOLDOWN_MAX_MS);
       const cause = this.lastChildFailure[name];
-      const message = `${name} stopped more than ${MAX_RESTARTS_PER_WINDOW} times in 60 seconds; automatic restart is disabled`
+      const message = `${name} stopped more than ${MAX_RESTARTS_PER_WINDOW} times in 60 seconds; retrying in ${Math.round(delay / 1000)}s`
         + (cause ? `; last failure: ${cause}` : "");
-      this.tryWriteState("failed", message);
-      this.publishOperation?.({ name: "runtime-recovery", status: "failed", message });
-      return;
+      this.tryWriteState("degraded", message);
+      this.publishOperation?.({ name: "runtime-recovery", status: "running", message });
+    } else {
+      delay = Math.min(attempts * 1_000, 5_000);
     }
-    const delay = Math.min(attempts * 1_000, 5_000);
     this.restartTimers[name] = setTimeout(() => {
       this.restartTimers[name] = null;
       const recovery = this.recover(name).catch((error) => {
@@ -1371,6 +1446,8 @@ class RuntimeSupervisor {
       throw new Error(message);
     }
     this.publishOperation?.({ name: "runtime-recovery", status: "completed", message: `${name} recovered` });
+    this.recoveryCooldowns[name] = 0;
+    this.restartHistory[name] = [];
   }
 
   async cleanupFailedStart(config) {
@@ -1893,6 +1970,7 @@ class RuntimeSupervisor {
   }
 
   async stopChild(name, timeoutMs = 10_000) {
+    if (name === "daemon") this.stopDaemonMonitor();
     const child = this[name];
     if (!child || child.exitCode !== null || child.signalCode !== null) {
       this[name] = null;
@@ -1949,6 +2027,7 @@ class RuntimeSupervisor {
     const config = this.readConfig();
     this.stopping = true;
     this.stopTunnelMonitor();
+    this.stopDaemonMonitor();
     for (const name of ["daemon", "tunnel"]) {
       if (this.restartTimers[name]) {
         clearTimeout(this.restartTimers[name]);
@@ -2053,6 +2132,7 @@ class RuntimeSupervisor {
     this.logger.warn("runtime.forced_shutdown_started", { message: errorMessage(reason) });
     this.stopping = true;
     this.stopTunnelMonitor();
+    this.stopDaemonMonitor();
     for (const name of ["daemon", "tunnel"]) {
       if (this.restartTimers[name]) {
         clearTimeout(this.restartTimers[name]);

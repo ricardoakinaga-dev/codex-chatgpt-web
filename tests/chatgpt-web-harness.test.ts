@@ -1241,6 +1241,48 @@ describe("ChatGPT outer-native harness v4", () => {
     }
   });
 
+  test("a tools-mode browser turn wires the provisional text reset into a text_reset event", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-text-reset-${process.pid}-${Date.now()}`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://text-reset-${Date.now()}`,
+      chatgptWeb: {
+        brokerSocketPath: socketPath,
+        localToolsEnabled: true,
+        solAvailable: true,
+        extraHighAvailable: true,
+        proAvailable: true,
+        threadEnvironmentStatePath: join(tempRoot, "text-reset-environment.json"),
+        lunaCheckpointStatePath: join(tempRoot, "text-reset-checkpoint.json"),
+      },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    let captured: BrowserTurn | undefined;
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      captured = turn;
+      await turn.prepare();
+      turn.onSendActivated?.();
+      turn.onTextDelta?.("PROVISORIO");
+      turn.onTextReset?.("AUTORITATIVO");
+      return "AUTORITATIVO";
+    };
+    try {
+      const events: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(
+        rawWireRequest(environmentXml),
+        { headers: new Headers() },
+        event => events.push(event),
+      );
+      expect(typeof captured?.onTextReset).toBe("function");
+      expect(events).toContainEqual({ type: "text_reset", text: "AUTORITATIVO" });
+      expect(events.at(-1)).toMatchObject({ type: "done" });
+    } finally {
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      await TurnBroker.forSocket(socketPath).close();
+    }
+  });
+
   test("caps automatic transient-server-error browser sends at three retries for one native turn", async () => {
     const socketPath = brokerTestEndpoint(`cgw-h4-retry-budget-${process.pid}-${Date.now()}`);
     const provider: CodexProviderConfig = {

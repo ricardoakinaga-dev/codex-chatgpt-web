@@ -102,16 +102,30 @@ export class ChatGptTextFeed {
   private readonly queued: string[] = [];
   private readonly waiters = new Set<TextWaiter>();
   private text = "";
+  private resetText: string | undefined;
 
   push(delta: string): void {
     if (!delta) return;
     this.text += delta;
     this.queued.push(delta);
-    const waiter = this.waiters.values().next().value as TextWaiter | undefined;
-    if (!waiter) return;
-    this.waiters.delete(waiter);
-    if (waiter.signal && waiter.onAbort) waiter.signal.removeEventListener("abort", waiter.onAbort);
-    waiter.resolve();
+    this.wake();
+  }
+
+  /**
+   * Replace the accumulated text with the authoritative final Markdown without emitting a delta.
+   * The paired renderer streams provisional deltas and then commits the confirmed answer here;
+   * `takeReset` forwards it as one `text_reset` event so Codex's `.done` item carries the truth.
+   */
+  reset(value: string): void {
+    this.text = value;
+    this.resetText = value;
+    this.wake();
+  }
+
+  takeReset(): string | undefined {
+    const value = this.resetText;
+    this.resetText = undefined;
+    return value;
   }
 
   drain(): string[] {
@@ -123,7 +137,7 @@ export class ChatGptTextFeed {
   }
 
   wait(signal?: AbortSignal): Promise<void> {
-    if (this.queued.length > 0) return Promise.resolve();
+    if (this.queued.length > 0 || this.resetText !== undefined) return Promise.resolve();
     if (signal?.aborted) return Promise.reject(new DOMException("text wait aborted", "AbortError"));
     return new Promise<void>((resolveWait, rejectWait) => {
       const waiter: TextWaiter = { resolve: resolveWait, reject: rejectWait, ...(signal ? { signal } : {}) };
@@ -136,6 +150,14 @@ export class ChatGptTextFeed {
       }
       this.waiters.add(waiter);
     });
+  }
+
+  private wake(): void {
+    const waiter = this.waiters.values().next().value as TextWaiter | undefined;
+    if (!waiter) return;
+    this.waiters.delete(waiter);
+    if (waiter.signal && waiter.onAbort) waiter.signal.removeEventListener("abort", waiter.onAbort);
+    waiter.resolve();
   }
 }
 

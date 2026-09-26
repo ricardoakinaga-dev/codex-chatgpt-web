@@ -617,7 +617,7 @@ export async function responseRequest(
     });
   }
   const adapter = adapterFactory(provider);
-  const queue = new AsyncEventQueue<AdapterEvent>();
+  const queue = new AsyncEventQueue<AdapterEvent>(10_000, parsed.stream ? "throw" : "grow");
   const abort = new AbortController();
   if (req.signal.aborted) abort.abort();
   else req.signal.addEventListener("abort", () => abort.abort(), { once: true });
@@ -628,9 +628,25 @@ export async function responseRequest(
         queue.push(event);
       });
     } catch (error) {
-      const event: AdapterEvent = { type: "error", message: error instanceof Error ? error.message : String(error) };
+      const adapterError = error instanceof ChatGptWebAdapterError ? error : undefined;
+      const event: AdapterEvent = {
+        type: "error",
+        message: error instanceof Error ? error.message : String(error),
+        ...(adapterError
+          ? {
+              status: adapterError.status,
+              errorType: adapterError.errorType,
+              code: adapterError.code,
+              retryable: adapterError.retryable,
+            }
+          : {}),
+      };
       options.onAdapterEvent?.(event);
-      queue.push(event);
+      try {
+        queue.push(event);
+      } catch {
+        queue.close();
+      }
     } finally {
       queue.close();
     }
@@ -639,7 +655,12 @@ export async function responseRequest(
   const responseModel = route.slug;
 
   if (parsed.stream) {
-    void run();
+    void run().catch(error => {
+      console.error(
+        `[chatgpt-web] adapter run rejected after the response stream was opened: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      queue.close();
+    });
     const stream = bridgeToResponsesSSE(
       queue,
       responseModel,
@@ -655,6 +676,7 @@ export async function responseRequest(
           : {}),
         ...(compactionItem ? { compaction: true } : {}),
         onCompletedResponse: rememberCompletedResponse,
+        ...(traceId ? { traceId } : {}),
       },
     );
     return new Response(stream, {
@@ -667,14 +689,16 @@ export async function responseRequest(
     });
   }
 
+  const collecting = queue.collect();
   await run();
-  const events = await queue.collect();
+  const events = await collecting;
   const json = buildResponseJSON(events, responseModel, {
     hideThinkingSummary: parsed.options.hideThinkingSummary,
     toolNsMap: maps.toolNsMap,
     freeformToolNames: maps.freeformToolNames,
     toolSearchToolNames: maps.toolSearchToolNames,
     ...(compactionItem ? { compaction: true } : {}),
+    ...(traceId ? { traceId } : {}),
   });
   rememberCompletedResponse(json);
   return Response.json(json);
@@ -1024,11 +1048,12 @@ export function startServer(
               subagentProtocol: readCodexSubagentProtocol(config.subagentProtocol),
             };
           } catch (error) {
-            return recordResult(formatErrorResponse(
-              500,
-              "server_error",
-              `Could not resolve the installed subagent protocol: ${error instanceof Error ? error.message : String(error)}`,
-            ), modelCatalogFailure("config", error));
+            // A damaged journal must not take the whole model catalog down. The persisted config is
+            // still a usable fallback, and doctor/repair remain available to resolve the journal.
+            console.warn(
+              `[codex-chatgpt-web] model catalog is using the persisted subagent protocol because journal resolution failed: ${error instanceof Error ? error.message : String(error)}`,
+            );
+            catalogConfig = { ...config };
           }
           let failure: ModelCatalogFailure | undefined;
           const response = await modelsRequest(

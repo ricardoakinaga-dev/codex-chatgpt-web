@@ -3,7 +3,16 @@ export class AsyncEventQueue<T> implements AsyncIterable<T> {
   private readonly waiters: Array<(result: IteratorResult<T>) => void> = [];
   private closed = false;
 
-  constructor(private readonly maxBuffered = 10_000) {}
+  /**
+   * `throw` (default) keeps a hard memory ceiling for a queue whose consumer can stall.
+   * `grow` is for callers that start a consumer before producing (the non-streaming Responses
+   * path): the buffer is then bounded by the producer/consumer gap instead of failing a long turn
+   * with a false "completed" result.
+   */
+  constructor(
+    private readonly maxBuffered = 10_000,
+    private readonly overflow: "throw" | "grow" = "throw",
+  ) {}
 
   push(value: T): void {
     if (this.closed) return;
@@ -12,7 +21,9 @@ export class AsyncEventQueue<T> implements AsyncIterable<T> {
       waiter({ value, done: false });
       return;
     }
-    if (this.buffered.length >= this.maxBuffered) throw new Error("Adapter event backlog exceeded");
+    if (this.overflow === "throw" && this.buffered.length >= this.maxBuffered) {
+      throw new Error("Adapter event backlog exceeded");
+    }
     this.buffered.push(value);
   }
 

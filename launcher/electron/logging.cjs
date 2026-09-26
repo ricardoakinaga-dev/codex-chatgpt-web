@@ -175,22 +175,45 @@ function createLogger({ filePath, publish }) {
   };
 }
 
+let processGuardsInstalled = false;
+
+function appendDiagnosticLine(filePath, text) {
+  try {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
+    fs.appendFileSync(filePath, `${new Date().toISOString()} ${text}\n`, { mode: 0o600 });
+  } catch {
+    // A lost diagnostic sink must not become a second process error.
+  }
+}
+
 function installProcessDiagnosticGuards({ filePath, streams = [process.stdout, process.stderr] }) {
   const guarded = new Set();
   for (const stream of streams) {
     if (!stream || typeof stream.on !== "function" || guarded.has(stream)) continue;
     guarded.add(stream);
     stream.on("error", (error) => {
-      try {
-        fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
-        fs.appendFileSync(
-          filePath,
-          `${new Date().toISOString()} ${error instanceof Error ? error.stack || error.message : String(error)}\n`,
-          { mode: 0o600 },
-        );
-      } catch {
-        // A lost diagnostic sink must not become a second process error.
-      }
+      appendDiagnosticLine(
+        filePath,
+        error instanceof Error ? error.stack || error.message : String(error),
+      );
+    });
+  }
+  // The launcher keeps running after a stray rejection or uncaught exception: dropping the main
+  // process would kill an active Codex turn and every supervised child with it. The diagnostic
+  // line is the durable evidence; tests pass explicit streams and never install these handlers.
+  if (!processGuardsInstalled && streams.includes(process.stdout)) {
+    processGuardsInstalled = true;
+    process.on("unhandledRejection", (reason) => {
+      appendDiagnosticLine(
+        filePath,
+        `unhandledRejection ${reason instanceof Error ? reason.stack || reason.message : String(reason)}`,
+      );
+    });
+    process.on("uncaughtException", (error) => {
+      appendDiagnosticLine(
+        filePath,
+        `uncaughtException ${error instanceof Error ? error.stack || error.message : String(error)}`,
+      );
     });
   }
 }

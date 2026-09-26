@@ -445,6 +445,22 @@ describe("reversible native Codex route integration", () => {
     expect(() => inspectCodexIntegration()).toThrow("different baselines");
   });
 
+  test("an interrupted first install leaves an inert recovery journal instead of wedging every command", () => {
+    const { codexHome } = fixture();
+    const configPath = join(codexHome, "config.toml");
+    const original = 'model = "gpt-5.6-sol"\n';
+    writeFileSync(configPath, original);
+    installCodexIntegration(nativeConfig("browser-only"));
+    const recovery = readFileSync(getCodexJournalRecoveryPath(), "utf8");
+    rmSync(getCodexJournalPath());
+    // Crash window: the recovery intent reached disk, but the config commit never happened.
+    writeFileSync(configPath, original);
+
+    expect(inspectCodexIntegration()).toMatchObject({ installed: false, active: false, errors: [] });
+    expect(readCodexSubagentProtocol("compatibility-v1")).toBe("compatibility-v1");
+    expect(readFileSync(getCodexJournalRecoveryPath(), "utf8")).toBe(recovery);
+  });
+
   test("reconciles either side of a crash between recovery intent, config, and primary commit", () => {
     const { codexHome } = fixture();
     const configPath = join(codexHome, "config.toml");

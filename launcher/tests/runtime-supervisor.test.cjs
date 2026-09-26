@@ -1339,11 +1339,15 @@ test("crash-loop diagnostics include the last redacted child failure", () => {
   supervisor.lastChildFailure.tunnel = "tunnel exited (1): invalid profile for [tunnel-id]";
   try {
     supervisor.scheduleRecovery("tunnel");
-    const failure = operations.at(-1);
-    assert.equal(failure.status, "failed");
-    assert.match(failure.message, /automatic restart is disabled/);
-    assert.match(failure.message, /last failure: tunnel exited \(1\): invalid profile for \[tunnel-id\]/);
+    const recovery = operations.at(-1);
+    assert.equal(recovery.status, "running");
+    assert.match(recovery.message, /retrying in 60s/);
+    assert.match(recovery.message, /last failure: tunnel exited \(1\): invalid profile for \[tunnel-id\]/);
+    assert.deepEqual(supervisor.restartHistory.tunnel, []);
+    assert.equal(supervisor.recoveryCooldowns.tunnel, 1);
   } finally {
+    if (supervisor.restartTimers.tunnel) clearTimeout(supervisor.restartTimers.tunnel);
+    supervisor.restartTimers.tunnel = null;
     fs.rmSync(root, { recursive: true, force: true });
   }
 });

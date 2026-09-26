@@ -1,8 +1,19 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright-core";
+import { ChatGptWebAdapterError } from "./adapters/chatgpt-web/adapter-error";
 import { expandUserPath } from "./config";
 import { processRunning } from "./process";
+
+function launcherUnavailableError(message: string, cause?: unknown): ChatGptWebAdapterError {
+  return new ChatGptWebAdapterError(message, {
+    status: 502,
+    errorType: "server_error",
+    code: "chatgpt_launcher_unavailable",
+    retryable: false,
+    ...(cause === undefined ? {} : { cause }),
+  });
+}
 
 export const LAUNCHER_BROWSER_HOST_KIND = "codex-web-gpt-launcher";
 export const LAUNCHER_BROWSER_IDLE_URL = "data:text/html;charset=utf-8,%3C!doctype%20html%3E%3Chtml%3E%3Chead%3E%3Cmeta%20charset%3D%22utf-8%22%3E%3Ctitle%3ECodex%20Web%20GPT%3C%2Ftitle%3E%3C%2Fhead%3E%3Cbody%3E%3C%2Fbody%3E%3C%2Fhtml%3E#codex-web-gpt-browser-host";
@@ -151,7 +162,11 @@ function assertDescriptorShape(value: unknown): LauncherBrowserHostDescriptor {
 
 export function readLauncherBrowserHostDescriptor(configuredPath: string): LauncherBrowserHostDescriptor {
   const path = resolve(expandUserPath(configuredPath));
-  if (!existsSync(path)) throw new Error(`Launcher browser host is unavailable: descriptor is missing at ${path}`);
+  if (!existsSync(path)) {
+    throw launcherUnavailableError(
+      `Codex Web GPT launcher is not running: the browser descriptor is missing at ${path}. Open the launcher and retry.`,
+    );
+  }
   const stat = statSync(path);
   if (!stat.isFile()) throw new Error(`Launcher browser descriptor is not a regular file: ${path}`);
   if (process.platform !== "win32") {
@@ -669,13 +684,28 @@ export async function notifyLauncherTurn(
     const body = await response.json().catch(() => ({})) as Record<string, unknown>;
     if (activity.phase === "start") {
       if (typeof body.surfaceId !== "string" || !/^[A-Za-z0-9_-]{32}$/.test(body.surfaceId)) {
-        throw new Error("Launcher browser control channel returned an invalid turn surface id");
+        throw new ChatGptWebAdapterError("Launcher browser control channel returned an invalid turn surface id", {
+          status: 502,
+          errorType: "server_error",
+          code: "chatgpt_browser_control_invalid",
+          retryable: false,
+        });
       }
       if (typeof body.reused !== "boolean") {
-        throw new Error("Launcher browser control channel returned an invalid reuse state");
+        throw new ChatGptWebAdapterError("Launcher browser control channel returned an invalid reuse state", {
+          status: 502,
+          errorType: "server_error",
+          code: "chatgpt_browser_control_invalid",
+          retryable: false,
+        });
       }
       if (typeof body.connectorBound !== "boolean") {
-        throw new Error("Launcher browser control channel returned an invalid connector state");
+        throw new ChatGptWebAdapterError("Launcher browser control channel returned an invalid connector state", {
+          status: 502,
+          errorType: "server_error",
+          code: "chatgpt_browser_control_invalid",
+          retryable: false,
+        });
       }
       return {
         surfaceId: body.surfaceId,

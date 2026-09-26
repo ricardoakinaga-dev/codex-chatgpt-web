@@ -14,10 +14,11 @@ type Snapshot = {
   completionActionVisible: boolean;
   stoppedThinkingVisible: boolean;
   traceBlocks: { kind: string; text: string }[];
+  pairedTurn: boolean;
 };
 
 // Execute the production page callback, with only missing Domino browser APIs supplied.
-async function snapshot(html: string): Promise<Snapshot> {
+async function snapshot(html: string, provisionalPaired = false): Promise<Snapshot> {
   const { createWindow } = require("@mixmark-io/domino");
   const window = createWindow(html);
   const innerText = Object.getOwnPropertyDescriptor(window.HTMLElement.prototype, "innerText");
@@ -51,9 +52,9 @@ async function snapshot(html: string): Promise<Snapshot> {
       page: () => ({ isClosed: () => false }),
     } as unknown as Locator;
     const worker = Object.create(ChatGptBrowserWorker.prototype) as {
-      responseDomSnapshot(locator: Locator): Promise<Snapshot>;
+      responseDomSnapshot(locator: Locator, cache?: unknown, provisionalPaired?: boolean): Promise<Snapshot>;
     };
-    const result = await worker.responseDomSnapshot(locator);
+    const result = await worker.responseDomSnapshot(locator, undefined, provisionalPaired);
     expect(errors).toEqual([]);
     return result;
   } finally {
@@ -72,6 +73,7 @@ test("keeps an unfinished hyperlink buffered and detects changed destinations af
   const page = (href: string) => `<section id="turn"><div class="markdown"><p data-start="0" data-end="99"><strong><a${href}>Open report</a></strong>.</p><p data-start="100" data-end="115">Next paragraph.</p></div></section>`;
   const buffer = new ChatGptMarkdownBuffer(markdown => markdown, 0);
   const pending = await snapshot(page(""));
+  expect(pending.pairedTurn).toBeFalse();
   expect(buffer.observe(pending.markdownSegments, 0)).toBe("");
   const linked = await snapshot(page(' href="https://example.com/report#details"'));
   expect(buffer.observe(linked.markdownSegments, 1000)).toBe("**[Open report](https://example.com/report#details)**.");
@@ -131,6 +133,7 @@ test("paired turns read only assistant Markdown and require an external completi
     FOOTER
   </div>`;
   const pending = await snapshot(content);
+  expect(pending.pairedTurn).toBeTrue();
   expect(pending.visibleText).not.toContain("SECRET USER PROMPT");
   expect(pending.visibleText).not.toContain("FOOTER");
   expect(pending.completionActionVisible).toBeFalse();
@@ -140,8 +143,29 @@ test("paired turns read only assistant Markdown and require an external completi
   expect(completed.fullHtml).not.toContain("SECRET USER PROMPT");
 });
 
-test("paired renderer revisions after tool calls are buffered until completion without leaking stale paragraphs", async () => {
-  const paired = (answer: string, completed = false) => `<div id="turn" data-turn-key="active-pair">
+test("provisional paired streaming marks unranged blocks without making them streamable", async () => {
+  const paired = `<div id="turn" data-turn-key="provisional-pair">
+    <div data-user-message-bubble="true">Private input</div>
+    <div data-markdown-text-style="assistant-message"><p>Resposta provisória.</p></div>
+  </div>`;
+  const provisional = await snapshot(paired, true);
+  expect(provisional.pairedTurn).toBeTrue();
+  expect(provisional.markdownSegments.length).toBeGreaterThan(0);
+  for (const segment of provisional.markdownSegments) {
+    expect(segment.provisional).toBeTrue();
+    expect(segment.streamable).toBeFalse();
+  }
+  const buffered = await snapshot(paired);
+  expect(buffered.markdownSegments.every(segment => segment.provisional !== true)).toBeTrue();
+  const legacy = await snapshot(
+    '<section id="turn"><div class="markdown"><p data-start="0" data-end="25">Legacy</p><p data-start="26" data-end="40">Next</p></div></section>',
+    true,
+  );
+  expect(legacy.markdownSegments.some(segment => segment.streamable)).toBeTrue();
+  expect(legacy.markdownSegments.every(segment => segment.provisional !== true)).toBeTrue();
+});
+
+test("paired renderer revisions after tool calls are buffered until completion without leaking stale paragraphs", async () => {  const paired = (answer: string, completed = false) => `<div id="turn" data-turn-key="active-pair">
     <div data-user-message-bubble="true">Private task input</div>
     <div data-markdown-text-style="assistant-message">${answer}</div>
     ${completed ? '<button aria-label="Copiar"></button>' : ''}

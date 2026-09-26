@@ -1,5 +1,9 @@
 # Mutable paired-renderer text recovery
 
+> Superseded for normal paired turns by `docs/paired-provisional-streaming-2026-09-25.md`:
+> append-only provisional deltas now stream live and the confirmed final Markdown is committed
+> through `text_reset`. Compaction and Luna rolling checkpoints keep this buffered behavior.
+
 ## Observed failure
 
 At 2026-09-25 00:23:37 UTC, trace `4fdf27ddf09e` committed the browser completion

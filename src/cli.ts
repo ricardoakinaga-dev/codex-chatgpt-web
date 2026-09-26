@@ -559,6 +559,28 @@ async function uninstallCommand(args: string[]): Promise<void> {
   stdout.write(keepData ? "Uninstalled; private application data was preserved.\n" : "Uninstalled and removed private application data.\n");
 }
 
+let daemonProcessGuardsInstalled = false;
+
+/**
+ * A stray rejection must not take the Responses daemon down without a diagnostic line, and the
+ * launcher supervisor is the component that decides when to restart a process. Uncaught
+ * exceptions exit deliberately so that supervisor sees a clean nonzero exit instead of a silent
+ * SIGSEGV-style disappearance; unhandled rejections are logged and tolerated.
+ */
+function installDaemonProcessGuards(): void {
+  if (daemonProcessGuardsInstalled) return;
+  daemonProcessGuardsInstalled = true;
+  process.on("unhandledRejection", reason => {
+    console.error(
+      `[chatgpt-web] unhandled rejection (process kept alive): ${reason instanceof Error ? reason.stack ?? reason.message : String(reason)}`,
+    );
+  });
+  process.on("uncaughtException", error => {
+    console.error(`[chatgpt-web] uncaught exception; exiting for supervisor recovery: ${error.stack ?? error.message}`);
+    process.exit(1);
+  });
+}
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const home = takeOption(args, "--home");
@@ -600,6 +622,7 @@ async function main(): Promise<void> {
     }
   } else if (command === "serve") {
     assertNoArgs(args);
+    installDaemonProcessGuards();
     const config = loadConfig();
     const server = startServer(config);
     stdout.write(`codex-chatgpt-web ${VERSION} listening on http://${config.host}:${server.port}/v1 (${config.mode})\n`);

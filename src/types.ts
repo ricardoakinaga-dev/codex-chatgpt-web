@@ -190,6 +190,12 @@ export interface CodexProviderContinuationState {
 export type AdapterEvent =
   | { type: "heartbeat" }
   | { type: "text_delta"; text: string; phase?: CodexMessagePhase }
+  /**
+   * Authoritative replacement for the currently open assistant text. Used by the paired renderer:
+   * provisional deltas give the user live text, and this reset commits the confirmed final
+   * Markdown through the same message's `.done` item (Codex treats `.done` as authoritative).
+   */
+  | { type: "text_reset"; text: string }
   | { type: "thinking_delta"; thinking: string }
   // Opaque signed-reasoning metadata preserved when it appears in a Codex history.
   | { type: "thinking_signature"; signature: string }

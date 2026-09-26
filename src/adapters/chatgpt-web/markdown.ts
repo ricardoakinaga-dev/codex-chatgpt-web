@@ -154,6 +154,12 @@ export interface ChatGptMarkdownSegment {
   sourceStart?: number;
   sourceEnd?: number;
   streamable: boolean;
+  /**
+   * Paired-renderer block without immutable identity. It is streamed as append-only provisional
+   * text (never committed under the consistency contract) and the completion reset publishes the
+   * authoritative Markdown. A rewrite stops live emission instead of failing the turn.
+   */
+  provisional?: boolean;
 }
 
 interface ChatGptMarkdownCandidate extends ChatGptMarkdownSegment {
@@ -202,6 +208,11 @@ export class ChatGptMarkdownBuffer {
   private markdown = "";
   private lastGroup: string | undefined;
   private consistencyError: ChatGptMarkdownConsistencyError | undefined;
+  private provisionalMode = false;
+  private readonly provisionalEmitted = new Map<string, string>();
+  private provisionalHeld = false;
+  private provisionalAnyEmitted = false;
+  private provisionalLastGroup: string | undefined;
 
   constructor(
     private readonly transform: (markdown: string) => string = markdown => markdown,
@@ -212,7 +223,13 @@ export class ChatGptMarkdownBuffer {
     }
   }
 
+  get provisional(): boolean {
+    return this.provisionalMode;
+  }
+
   observe(segments: ChatGptMarkdownSegment[], now = Date.now()): string {
+    if (segments.some(segment => segment.provisional)) this.provisionalMode = true;
+    if (this.provisionalMode) return this.observeProvisional(segments);
     const reconciled = this.reconcile(segments);
     if (reconciled instanceof ChatGptMarkdownConsistencyError) {
       this.consistencyError = reconciled;
@@ -265,7 +282,45 @@ export class ChatGptMarkdownBuffer {
     return delta;
   }
 
+  /**
+   * Append-only provisional emission for paired blocks. Only the longest observed extension of an
+   * already-emitted block is returned, so Codex never receives text it must retract. A rewrite or
+   * reorder holds all further emission; `finish()` still returns the complete authoritative text.
+   */
+  private observeProvisional(segments: ChatGptMarkdownSegment[]): string {
+    this.latest = segments.map(segment => ({ ...segment }));
+    if (this.provisionalHeld) return "";
+    let delta = "";
+    for (const segment of segments) {
+      if (!segment.provisional) continue;
+      const candidateId = this.candidateId(segment);
+      const emitted = this.provisionalEmitted.get(candidateId) ?? "";
+      if (!segment.text.startsWith(emitted)) {
+        this.provisionalHeld = true;
+        return delta;
+      }
+      if (segment.text.length === emitted.length) continue;
+      const separator = emitted === "" && this.provisionalAnyEmitted
+        ? segment.group !== undefined && segment.group === this.provisionalLastGroup ? "\n" : "\n\n"
+        : "";
+      delta += separator + segment.text.slice(emitted.length);
+      this.provisionalEmitted.set(candidateId, segment.text);
+      this.provisionalAnyEmitted = true;
+      this.provisionalLastGroup = segment.group;
+    }
+    return delta;
+  }
+
   finish(): { markdown: string; delta: string } {
+    if (this.provisionalMode) {
+      for (const segment of this.latest) {
+        this.commit(segment);
+        this.committed.push(this.committedSegment(segment));
+      }
+      this.candidates.clear();
+      this.latest = [];
+      return { markdown: this.markdown, delta: "" };
+    }
     if (this.consistencyError) throw this.consistencyError;
     let delta = "";
     for (const segment of this.latest) {
@@ -421,5 +476,75 @@ export class ChatGptMarkdownBuffer {
     this.markdown += delta;
     this.lastGroup = segment.group;
     return delta;
+  }
+}
+
+export interface ChatGptPairedRangeAuditSummary {
+  /** Ranged blocks seen across all snapshots of one turn. */
+  rangedBlockObservations: number;
+  /** Ranged blocks that the buffer WOULD have committed (stable + followed). */
+  commitsPredicted: number;
+  /** Predicted commits whose text later changed: streaming would have failed this turn. */
+  rewritesAfterPredictedCommit: number;
+  /** Snapshots whose ranged blocks were not monotonic in source order. */
+  orderViolations: number;
+}
+
+/**
+ * Shadow observer for the paired renderer. It applies the same commit rule as
+ * `ChatGptMarkdownBuffer` to blocks that carry immutable source ranges, but never emits anything.
+ *
+ * The v6.0.0 buffering decision is re-evaluated from evidence, not assumption: a paired renderer
+ * that exposes ranges AND survives the shadow commit rule can stream safely, while one that
+ * rewrites a predicted-committed range must stay buffered because Responses deltas cannot be
+ * retracted. One privacy-safe summary line is logged per paired turn that exposes ranges.
+ */
+export class ChatGptPairedRangeAudit {
+  private readonly committed = new Map<string, string>();
+  private readonly pending = new Map<string, { text: string; since: number }>();
+  private rangedBlockObservations = 0;
+  private commitsPredicted = 0;
+  private rewritesAfterPredictedCommit = 0;
+  private orderViolations = 0;
+
+  observe(segments: ChatGptMarkdownSegment[], now = Date.now(), stabilityMs = 750): void {
+    const seen = new Set<string>();
+    let previousStart: number | undefined;
+    for (const [index, segment] of segments.entries()) {
+      if (segment.sourceStart === undefined) continue;
+      this.rangedBlockObservations += 1;
+      if (previousStart !== undefined && segment.sourceStart <= previousStart) this.orderViolations += 1;
+      previousStart = segment.sourceStart;
+
+      const id = `${segment.sourceStart}:${segment.tag ?? ""}`;
+      seen.add(id);
+      const committed = this.committed.get(id);
+      if (committed !== undefined) {
+        if (committed !== segment.text) this.rewritesAfterPredictedCommit += 1;
+        continue;
+      }
+      const pending = this.pending.get(id);
+      if (!pending || pending.text !== segment.text) {
+        this.pending.set(id, { text: segment.text, since: now });
+        continue;
+      }
+      if (index < segments.length - 1 && now - pending.since >= stabilityMs) {
+        this.committed.set(id, segment.text);
+        this.pending.delete(id);
+        this.commitsPredicted += 1;
+      }
+    }
+    for (const id of [...this.pending.keys()]) {
+      if (!seen.has(id)) this.pending.delete(id);
+    }
+  }
+
+  summary(): ChatGptPairedRangeAuditSummary {
+    return {
+      rangedBlockObservations: this.rangedBlockObservations,
+      commitsPredicted: this.commitsPredicted,
+      rewritesAfterPredictedCommit: this.rewritesAfterPredictedCommit,
+      orderViolations: this.orderViolations,
+    };
   }
 }

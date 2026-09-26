@@ -107,6 +107,14 @@ export function bridgeToResponsesSSE(
     streamPlatform?: NodeJS.Platform;
     /** Test seam for the monotonic upstream-silence clock. */
     now?: () => number;
+    /**
+     * Cancel a turn whose HTTP client stopped reading for this long. Bun does not always surface a
+     * dropped response consumer, so an abandoned Codex turn would otherwise keep its browser tab
+     * leased until ChatGPT responds or the turn errors.
+     */
+    clientReadTimeoutMs?: number;
+    /** Local browser turn trace id, surfaced on terminal failures for diagnostics. */
+    traceId?: string;
   },
 ): ReadableStream<Uint8Array> {
   // Freeform/custom tools (apply_patch) carry their body in `input`; the model is given a
@@ -208,6 +216,11 @@ export function bridgeToResponsesSSE(
       const streamStartedAt = lastAdapterEventAt;
       const stallSec = resolveStallTimeoutSec(options?.stallTimeoutSec);
       const stallTimeoutMs = stallSec * 1000;
+      const clientReadTimeoutMs = options?.clientReadTimeoutMs ?? 30_000;
+      if (!Number.isFinite(clientReadTimeoutMs) || clientReadTimeoutMs <= 0) {
+        throw new Error("Client read timeout must be a positive finite number");
+      }
+      let clientReadBackpressureSince: number | undefined;
 
       let currentMsg: { itemId: string; outputIndex: number; text: string; phase?: CodexMessagePhase } | null = null;
       let currentReasoning: { itemId: string; outputIndex: number; text: string } | null = null;
@@ -263,7 +276,7 @@ export function bridgeToResponsesSSE(
       // synthetic compaction item's payload on done.
       let compactionText = "";
       let currentToolCall: { itemId: string; outputIndex: number; callId: string; name: string; args: string; namespace?: string; freeform?: boolean; toolSearch?: boolean; inputEmitted?: string } | null = null;
-      const closeCurrentMessage = () => {
+      const closeCurrentMessage = (finalStatus: "completed" | "incomplete" = "completed") => {
         if (!currentMsg) return;
         // Finalize the text part (Responses protocol). Without these .done events Codex never
         // commits the content part and renders the message as truncated / cut off.
@@ -275,7 +288,7 @@ export function bridgeToResponsesSSE(
           part: { type: "output_text", text: currentMsg.text, annotations: [] },
         });
         const item = {
-          type: "message", id: currentMsg.itemId, status: "completed", role: "assistant",
+          type: "message", id: currentMsg.itemId, status: finalStatus, role: "assistant",
           content: [{ type: "output_text", text: currentMsg.text, annotations: [] }],
           ...(currentMsg.phase ? { phase: currentMsg.phase } : {}),
         };
@@ -285,7 +298,7 @@ export function bridgeToResponsesSSE(
         currentMsg = null;
       };
 
-      const closeCurrentReasoning = () => {
+      const closeCurrentReasoning = (finalStatus?: "incomplete") => {
         if (!currentReasoning) return;
         emit("response.reasoning_summary_text.done", {
           item_id: currentReasoning.itemId, output_index: currentReasoning.outputIndex, summary_index: 0, text: currentReasoning.text,
@@ -298,6 +311,7 @@ export function bridgeToResponsesSSE(
         const item = {
           type: "reasoning", id: currentReasoning.itemId,
           summary: [{ type: "summary_text", text: currentReasoning.text }],
+          ...(finalStatus ? { status: finalStatus } : {}),
           ...(encrypted ? { encrypted_content: encrypted } : {}),
         };
         emit("response.output_item.done", { output_index: currentReasoning.outputIndex, item });
@@ -306,10 +320,11 @@ export function bridgeToResponsesSSE(
         currentReasoning = null;
       };
 
-      const closeCurrentRawReasoning = () => {
+      const closeCurrentRawReasoning = (finalStatus?: "incomplete") => {
         if (!currentRawReasoning) return;
         const item = {
           type: "reasoning", id: currentRawReasoning.itemId, summary: [],
+          ...(finalStatus ? { status: finalStatus } : {}),
           content: [{ type: "reasoning_text", text: currentRawReasoning.text }],
         };
         emit("response.output_item.done", { output_index: currentRawReasoning.outputIndex, item });
@@ -318,19 +333,21 @@ export function bridgeToResponsesSSE(
         currentRawReasoning = null;
       };
 
-      const closeCurrentToolCall = () => {
+      const closeCurrentToolCall = (finalStatus: "completed" | "incomplete" = "completed") => {
         if (!currentToolCall) return;
         // Empty input (no-arg tools like computer_use get_app_state / list_apps) must serialize as
         // "{}", never "" — Codex echoes the call back as a function_call next turn, and JSON.parse("")
         // would 400 the whole session ("invalid JSON arguments"), poisoning all later turns.
         const argsStr = currentToolCall.args || "{}";
         // Finalize streamed function-call arguments so Codex commits the call (incl. MCP / computer_use).
-        if (!currentToolCall.freeform && !currentToolCall.toolSearch) {
+        // On an incomplete turn those terminators are withheld: a partially received call must never
+        // be presented to Codex as a finished, executable tool invocation.
+        if (finalStatus === "completed" && !currentToolCall.freeform && !currentToolCall.toolSearch) {
           emit("response.function_call_arguments.done", {
             item_id: currentToolCall.itemId, output_index: currentToolCall.outputIndex, arguments: argsStr,
           });
         }
-        if (currentToolCall.freeform) {
+        if (finalStatus === "completed" && currentToolCall.freeform) {
           emit("response.custom_tool_call_input.done", {
             item_id: currentToolCall.itemId, output_index: currentToolCall.outputIndex,
             input: freeformInput(currentToolCall.args),
@@ -340,18 +357,18 @@ export function bridgeToResponsesSSE(
           ? {
               type: "tool_search_call", id: currentToolCall.itemId,
               call_id: currentToolCall.callId, execution: "client",
-              arguments: parseArgsObj(currentToolCall.args), status: "completed",
+              arguments: parseArgsObj(currentToolCall.args), status: finalStatus,
             }
           : currentToolCall.freeform
           ? {
               type: "custom_tool_call", id: currentToolCall.itemId,
               call_id: currentToolCall.callId, name: currentToolCall.name,
-              input: freeformInput(currentToolCall.args), status: "completed",
+              input: freeformInput(currentToolCall.args), status: finalStatus,
             }
           : {
               type: "function_call", id: currentToolCall.itemId,
               call_id: currentToolCall.callId, name: currentToolCall.name,
-              arguments: argsStr, status: "completed",
+              arguments: argsStr, status: finalStatus,
               ...(currentToolCall.namespace ? { namespace: currentToolCall.namespace } : {}),
               ...plaintextCollaborationFields(currentToolCall.namespace, currentToolCall.name),
             };
@@ -432,6 +449,7 @@ export function bridgeToResponsesSSE(
           // its compaction UI renders nothing mid-turn, so nothing is lost visually.
           if (options?.compaction) {
             if (event.type === "text_delta") { compactionText += event.text; continue; }
+            if (event.type === "text_reset") { compactionText = event.text; continue; }
             if (event.type !== "done" && event.type !== "incomplete" && event.type !== "error") continue;
           }
           switch (event.type) {
@@ -444,6 +462,30 @@ export function bridgeToResponsesSSE(
               flushHiddenRawReasoning();
               if (currentToolCall) closeCurrentToolCall();
               flushHiddenReasoningEnvelope();
+              break;
+            }
+            case "text_reset": {
+              // Provisional paired-renderer text is replaced by the confirmed final Markdown.
+              // Only the item's `.done` payload (and this message's final text) is authoritative;
+              // no delta is emitted, so nothing has to be retracted.
+              if (currentReasoning) closeCurrentReasoning();
+              if (currentRawReasoning) closeCurrentRawReasoning();
+              flushHiddenRawReasoning();
+              if (currentToolCall) closeCurrentToolCall();
+              if (!currentMsg) {
+                const itemId = `msg_${uuid()}`;
+                const item = {
+                  type: "message", id: itemId, status: "in_progress", role: "assistant",
+                  content: [] as { type: string; text: string; annotations: never[] }[],
+                };
+                emit("response.output_item.added", { output_index: outputIndex, item });
+                emit("response.content_part.added", {
+                  item_id: itemId, output_index: outputIndex, content_index: 0,
+                  part: { type: "output_text", text: "", annotations: [] },
+                });
+                currentMsg = { itemId, outputIndex, text: "" };
+              }
+              currentMsg.text = event.text;
               break;
             }
             case "text_delta": {
@@ -628,15 +670,16 @@ export function bridgeToResponsesSSE(
               break;
             }
             case "incomplete": {
-              if (currentMsg) closeCurrentMessage();
-              if (currentReasoning) closeCurrentReasoning();
-              if (currentRawReasoning) closeCurrentRawReasoning();
+              if (currentMsg) closeCurrentMessage("incomplete");
+              if (currentReasoning) closeCurrentReasoning("incomplete");
+              if (currentRawReasoning) closeCurrentRawReasoning("incomplete");
               flushHiddenRawReasoning();
-              if (currentToolCall) closeCurrentToolCall();
+              if (currentToolCall) closeCurrentToolCall("incomplete");
               flushHiddenReasoningEnvelope();
               emit("response.incomplete", {
                 response: {
                   ...responseSnapshot("incomplete", finishedItems, event.endTurn),
+                  ...(options?.traceId ? { trace_id: options.traceId } : {}),
                   usage: responsesUsage(event.usage),
                   incomplete_details: {
                     reason: event.reason,
@@ -650,15 +693,16 @@ export function bridgeToResponsesSSE(
               break;
             }
             case "error": {
-              if (currentMsg) closeCurrentMessage();
-              if (currentReasoning) closeCurrentReasoning();
-              if (currentRawReasoning) closeCurrentRawReasoning();
+              if (currentMsg) closeCurrentMessage("incomplete");
+              if (currentReasoning) closeCurrentReasoning("incomplete");
+              if (currentRawReasoning) closeCurrentRawReasoning("incomplete");
               flushHiddenRawReasoning();
-              if (currentToolCall) closeCurrentToolCall();
+              if (currentToolCall) closeCurrentToolCall("incomplete");
               const failure = adapterFailureFromEvent(event);
               emit("response.failed", {
                 response: {
                   ...responseSnapshot("failed", finishedItems),
+                  ...(options?.traceId ? { trace_id: options.traceId } : {}),
                   // Partial consumption from a mid-stream upstream failure: surfaced so the request
                   // log can record real tokens instead of usageStatus "unreported" with 0.
                   ...(event.usage ? { usage: responsesUsage(event.usage) } : {}),
@@ -681,10 +725,15 @@ export function bridgeToResponsesSSE(
         }
       } catch (err) {
         if (!terminated) {
+          if (currentMsg) closeCurrentMessage("incomplete");
+          if (currentReasoning) closeCurrentReasoning("incomplete");
+          if (currentRawReasoning) closeCurrentRawReasoning("incomplete");
           flushHiddenRawReasoning();
+          if (currentToolCall) closeCurrentToolCall("incomplete");
           emit("response.failed", {
             response: {
               ...responseSnapshot("failed", finishedItems),
+              ...(options?.traceId ? { trace_id: options.traceId } : {}),
               error: responseError(500, "proxy_error", err instanceof Error ? err.message : String(err)),
               last_error: responseError(500, "proxy_error", err instanceof Error ? err.message : String(err)),
             },
@@ -706,14 +755,15 @@ export function bridgeToResponsesSSE(
       if (!terminated) {
         // The adapter generator ended without an explicit done/error event. Mark as incomplete
         // rather than completed so Codex can distinguish a clean finish from a truncated stream.
-        if (currentMsg) closeCurrentMessage();
-        if (currentReasoning) closeCurrentReasoning();
-        if (currentRawReasoning) closeCurrentRawReasoning();
+        if (currentMsg) closeCurrentMessage("incomplete");
+        if (currentReasoning) closeCurrentReasoning("incomplete");
+        if (currentRawReasoning) closeCurrentRawReasoning("incomplete");
         flushHiddenRawReasoning();
-        if (currentToolCall) closeCurrentToolCall();
+        if (currentToolCall) closeCurrentToolCall("incomplete");
         emit("response.incomplete", {
           response: {
             ...responseSnapshot("incomplete", finishedItems),
+            ...(options?.traceId ? { trace_id: options.traceId } : {}),
             usage: responsesUsage(undefined),
             incomplete_details: { reason: "adapter_eof" },
           },
@@ -737,8 +787,24 @@ export function bridgeToResponsesSSE(
         emit("response.created", { response: responseSnapshot("in_progress", []) });
         gated = true;
         beat = setInterval(() => {
-          if (closed || gated) return;
+          if (closed) return;
           const checkedAt = now();
+          // A client that stopped reading keeps every enqueue buffered instead of failing, so the
+          // only disconnect evidence is sustained backpressure. Cancel once it outlives the budget.
+          if ((controller.desiredSize ?? 1) <= 0) {
+            clientReadBackpressureSince ??= checkedAt;
+            if (checkedAt - clientReadBackpressureSince >= clientReadTimeoutMs) {
+              console.error(
+                `[bridge] client_read_timeout model=${modelId} response=${responseId}`
+                + ` noReadMs=${checkedAt - clientReadBackpressureSince} emittedFrames=${emittedFrames}`,
+              );
+              cancelStream();
+              return;
+            }
+          } else {
+            clientReadBackpressureSince = undefined;
+          }
+          if (gated) return;
           const silenceMs = checkedAt - lastAdapterEventAt;
           if (silenceMs >= stallTimeoutMs / 2 && !stallWarned) {
             // Halfway to cancelling the turn. A healthy adapter heartbeats far more often than
@@ -759,14 +825,15 @@ export function bridgeToResponsesSSE(
               + ` sinceStreamStartMs=${checkedAt - streamStartedAt}`
               + ` iteratorStarted=${iteratorStarted} upstreamDone=${upstreamDone} emittedFrames=${emittedFrames}`,
             );
-            if (currentMsg) closeCurrentMessage();
-            if (currentReasoning) closeCurrentReasoning();
-            if (currentRawReasoning) closeCurrentRawReasoning();
+            if (currentMsg) closeCurrentMessage("incomplete");
+            if (currentReasoning) closeCurrentReasoning("incomplete");
+            if (currentRawReasoning) closeCurrentRawReasoning("incomplete");
             flushHiddenRawReasoning();
-            if (currentToolCall) closeCurrentToolCall();
+            if (currentToolCall) closeCurrentToolCall("incomplete");
             emit("response.incomplete", {
               response: {
                 ...responseSnapshot("incomplete", finishedItems),
+                ...(options?.traceId ? { trace_id: options.traceId } : {}),
                 incomplete_details: { reason: "upstream_stall_timeout" },
               },
             });
@@ -858,6 +925,8 @@ export function buildResponseJSON(
     /** Remote compaction v2 turn — append one synthetic compaction output item (see bridgeToResponsesSSE). */
     compaction?: boolean;
     onProviderState?: (state: CodexProviderContinuationState) => void;
+    /** Local browser turn trace id, surfaced on terminal failures for diagnostics. */
+    traceId?: string;
   },
 ): Record<string, unknown> {
   const responseId = `resp_${uuid()}`;
@@ -986,6 +1055,10 @@ export function buildResponseJSON(
           currentText += e.text;
         }
         break;
+      case "text_reset":
+        if (options?.compaction) compactionText = e.text;
+        else currentText = e.text;
+        break;
       case "thinking_delta":
         if (currentText) flushText();
         if (currentRawReasoning) flushRawReasoning();
@@ -1060,6 +1133,7 @@ export function buildResponseJSON(
     created_at: Math.floor(Date.now() / 1000),
     status,
     model: modelId, output,
+    ...(options?.traceId ? { trace_id: options.traceId } : {}),
     ...(endTurn !== undefined ? { end_turn: endTurn } : {}),
     ...(failure ? { error: failure.error, last_error: failure.error } : {}),
     ...(errorEvent?.retryable !== undefined ? { retryable: errorEvent.retryable } : {}),
