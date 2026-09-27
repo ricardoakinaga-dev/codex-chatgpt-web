@@ -7,7 +7,7 @@ type EffortMenu = Awaited<ReturnType<typeof activateChatGptEffortMenu>>;
 
 function familyError(family: ChatGptWebModelFamily, cause?: unknown): ChatGptWebAdapterError {
   return new ChatGptWebAdapterError(
-    `ChatGPT model ${family} could not be selected and verified. The pending message was not sent. Check whether the requested model is available in the browser and reload it before retrying.`,
+    `ChatGPT model ${family} could not be selected and verified. The pending message was not sent. Check whether the requested model is available in the browser and reload it before retrying. If ChatGPT uses an unsupported language, select English in Settings → General → Language and reload it.`,
     { status: 400, errorType: "invalid_request_error", code: "model_version_unavailable", retryable: false, cause },
   );
 }
@@ -15,7 +15,7 @@ function familyError(family: ChatGptWebModelFamily, cause?: unknown): ChatGptWeb
 function familyOption(menu: EffortMenu, family: ChatGptWebModelFamily) {
   return menu.menu.getByRole("menuitemradio", {
     name: family === "5.6" ? /^GPT[-\s]?5\.6\s+Sol(?:\s+Pro)?$/i
-      // pt-BR uses Recente; Simplified/Traditional Chinese and Japanese share 最新.
+      // pt-BR uses Recente; Simplified/Traditional Chinese and Japanese share 最新; Korean uses 최신.
       : /^(?:Latest|Recente|最新|최신|GPT[-\s]?6(?:\s+Astra)?(?:\s+Pro)?)$/i,
     exact: true,
     includeHidden: true,
@@ -40,10 +40,14 @@ export async function selectChatGptModelFamily(
     if (viewCount === 1) {
       // The current picker toggles between simple/advanced views without exposing
       // aria-expanded. Opening an already-advanced picker would hide the radio rows.
+      // Upstream 6.1.0 scopes the toggle inside the view; local picker needs menu scope.
+      // Accept either location to keep both fixtures working.
       const state = await view.getAttribute("data-model-picker-view");
       if (state !== "simple" && state !== "advanced") throw familyError(family);
       if (state === "simple") {
-        const toggle = menu.menu.locator('[role="menuitem"][data-model-picker-view-toggle="true"][aria-hidden="false"]');
+        // Menu-scope lookup covers both the upstream view-scoped toggle and the local
+        // menuitem toggle; the mock exposes locator only on menu.menu.
+        const toggle = menu.menu.locator('[data-model-picker-view-toggle="true"][aria-hidden="false"]');
         if (await toggle.count() !== 1) throw familyError(family);
         await toggle.click({ timeout: 5_000 });
       }
