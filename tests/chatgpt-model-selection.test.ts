@@ -14,8 +14,8 @@ test("model selection recognizes Latest in the launcher languages without accept
         waitFor: async () => { throw new Error("Requested family is absent"); },
       }),
       locator: () => ({ count: async () => 1, getAttribute: async () => "true" }),
-    } } as unknown as Parameters<typeof selectChatGptModelFamily>[1];
-    const selection = selectChatGptModelFamily({} as Parameters<typeof selectChatGptModelFamily>[0], menu, "6", async () => menu);
+    } } as unknown as Parameters<typeof selectChatGptModelFamily>[0];
+    const selection = selectChatGptModelFamily(menu, "6", async () => menu);
     if (accepted) expect(await selection).toBe(menu);
     else await expect(selection).rejects.toThrow("could not be selected and verified");
   }
@@ -54,6 +54,7 @@ function switchingPicker(options: {
           expect(view).toBe("advanced");
           optionClicks++;
           if (!options.ignoreSelection) selected = family;
+          view = "simple";
         },
       };
     },
@@ -70,28 +71,27 @@ function switchingPicker(options: {
         click: async () => { toggleClicks++; view = view === "simple" ? "advanced" : "simple"; },
       };
     },
-  } } as unknown as Parameters<typeof selectChatGptModelFamily>[1];
-  const page = { keyboard: { press: async (key: string) => { expect(key).toBe("Escape"); view = "simple"; } } } as Parameters<typeof selectChatGptModelFamily>[0];
-  return { menu, page, reopen: async () => menu, state: () => ({ selected, toggleClicks, optionClicks }) };
+  } } as unknown as Parameters<typeof selectChatGptModelFamily>[0];
+  return { menu, activate: async () => menu, state: () => ({ selected, toggleClicks, optionClicks }) };
 }
 
 test.each([true, false])("model family switches both directions and verifies the selected radio (modern=%s)", async modern => {
   const fixture = switchingPicker({ modern });
-  await selectChatGptModelFamily(fixture.page, fixture.menu, "5.6", fixture.reopen);
+  await selectChatGptModelFamily(fixture.menu, "5.6", fixture.activate);
   expect(fixture.state()).toEqual({ selected: "5.6", toggleClicks: 1, optionClicks: 1 });
-  await selectChatGptModelFamily(fixture.page, fixture.menu, "6", fixture.reopen);
+  await selectChatGptModelFamily(fixture.menu, "6", fixture.activate);
   expect(fixture.state()).toEqual({ selected: "6", toggleClicks: 2, optionClicks: 2 });
 });
 
 test("an already-open advanced picker must not be toggled closed", async () => {
   const fixture = switchingPicker({ advanced: true });
-  await selectChatGptModelFamily(fixture.page, fixture.menu, "5.6", fixture.reopen);
+  await selectChatGptModelFamily(fixture.menu, "5.6", fixture.activate);
   expect(fixture.state()).toEqual({ selected: "5.6", toggleClicks: 0, optionClicks: 1 });
 });
 
 test("an already-selected family does not change the picker or the model", async () => {
   const fixture = switchingPicker();
-  await selectChatGptModelFamily(fixture.page, fixture.menu, "6", fixture.reopen);
+  await selectChatGptModelFamily(fixture.menu, "6", fixture.activate);
   expect(fixture.state()).toEqual({ selected: "6", toggleClicks: 0, optionClicks: 0 });
 });
 
@@ -99,14 +99,14 @@ test.each([
   { viewState: "unknown" }, { toggles: 0 }, { toggles: 2 }, { duplicateOption: true },
 ])("ambiguous or unsupported picker state cannot silently select another model: %j", async options => {
   const fixture = switchingPicker(options);
-  await expect(selectChatGptModelFamily(fixture.page, fixture.menu, "5.6", fixture.reopen))
+  await expect(selectChatGptModelFamily(fixture.menu, "5.6", fixture.activate))
     .rejects.toMatchObject({ code: "model_version_unavailable", retryable: false });
   expect(fixture.state().optionClicks).toBe(0);
 });
 
 test("a click without the requested checked family is a failure, not a successful switch", async () => {
   const fixture = switchingPicker({ ignoreSelection: true });
-  await expect(selectChatGptModelFamily(fixture.page, fixture.menu, "5.6", fixture.reopen))
+  await expect(selectChatGptModelFamily(fixture.menu, "5.6", fixture.activate))
     .rejects.toMatchObject({ code: "model_version_unavailable", retryable: false });
   expect(fixture.state().selected).toBe("6");
 });
