@@ -1569,7 +1569,16 @@ export function chatGptNewTurnIdentity(
   const previous = new Set(initial);
   const added = current.filter(identity => !previous.has(identity));
   if (added.length > 1) {
-    throw new Error(`ChatGPT exposed ${added.length} new conversation turns for one submitted message`);
+    // ChatGPT re-keys a finished turn from a transient `fallback-turn-N` key to its stable id. The
+    // earlier turn then looks new even though only one message was submitted. Tolerate exactly as
+    // many extra identities as transient baseline keys that disappeared; the submission is always
+    // the last one in document order.
+    const currentSet = new Set(current);
+    const rekeyed = initial.filter(identity => /fallback-turn-\d+$/.test(identity) && !currentSet.has(identity)).length;
+    if (added.length - 1 <= rekeyed) return added[added.length - 1];
+    throw new Error(
+      `ChatGPT exposed ${added.length} new conversation turns for one submitted message (${added.join(", ")})`,
+    );
   }
   return added[0];
 }

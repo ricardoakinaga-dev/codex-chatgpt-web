@@ -91,6 +91,17 @@ test("conversation turn identity survives ChatGPT DOM virtualization", () => {
   )).toThrow("2 new conversation turns");
 });
 
+test("a finished turn re-keyed from its transient fallback key is not mistaken for a second submission", () => {
+  expect(chatGptNewTurnIdentity(
+    ["group:user:fallback-turn-0"],
+    ["group:user:uuid-old", "group:user:uuid-new"],
+  )).toBe("group:user:uuid-new");
+  expect(() => chatGptNewTurnIdentity(
+    ["group:user:uuid-0"],
+    ["group:user:uuid-0", "group:user:uuid-1", "group:user:uuid-2"],
+  )).toThrow("2 new conversation turns");
+});
+
 test("submission DOM tracks logical identities and retains virtualized history in its baseline", async () => {
   type Turn = { id: string; index: number; role: "user" | "assistant"; mounted: boolean };
   let turns: Turn[] = [
