@@ -12,6 +12,8 @@ import type { CodexParsedRequest, CodexUsage } from "../../types";
 import { compiledChatGptWebMessages, estimateChatGptWebImageTokens, estimateCompiledChatGptWebInputTokens } from "./input-tokens";
 import {
   CHATGPT_BIGGER_CONTEXT_PARTS,
+  CHATGPT_COMPACTION_PROMPT_JSON_BYTE_BUDGET,
+  chatGptPromptJsonBytes,
   compileChatGptWebPrompt,
   type ChatGptWebMultipartPartCount,
   type CompiledChatGptWebPrompt,
@@ -63,7 +65,7 @@ export function estimateChatGptWebInputTokens(
 /**
  * The compaction threshold chooses the initial part count. Whole records and composer limits
  * can require more parts even when the total token estimate is small. Plan before submission;
- * compaction always receives all six parts without passing through the legacy inline budget.
+ * compaction chooses the smallest complete transport; planning never trims its history to fit.
  */
 export function resolveBiggerContextMultipartParts(
   parsed: CodexParsedRequest,
@@ -77,7 +79,6 @@ export function resolveBiggerContextMultipartParts(
     throw new Error("Bigger Context is unavailable for Luna because its accumulated browser transcript still shares one 28,000-token transport budget");
   }
   const mode = resolveChatGptWebModelMode(parsed.modelId, parsed.options.reasoning, capabilities);
-  if (parsed._compactionRequest) return CHATGPT_BIGGER_CONTEXT_PARTS;
   const { contextWindow, autoCompactTokenLimit } = resolveChatGptWebContextLimits(
     CHATGPT_WEB_BACKEND_MODEL,
     mode.effort,
@@ -85,14 +86,13 @@ export function resolveBiggerContextMultipartParts(
   );
   const compile = (parts?: ChatGptWebMultipartPartCount): CompiledChatGptWebPrompt => compileChatGptWebPrompt(
     parsed, capabilities, mode.localTools ? ESTIMATE_TURN_TOKEN : undefined,
-    { experimentalMultipartParts: parts, experimentalSkillAttachments },
+    { experimentalMultipartParts: parts, experimentalSkillAttachments,
+      ...(parsed._compactionRequest ? { preserveCompactionHistory: true } : {}) },
   );
-  const inline = compile();
-  const inputTokens = estimateCompiledChatGptWebInputTokens(inline, parsed.modelId);
-  const initialParts = biggerContextPartCount(inputTokens, autoCompactTokenLimit, false);
-  if (initialParts === CHATGPT_BIGGER_CONTEXT_PARTS) return initialParts;
 
   const fits = (compiled: CompiledChatGptWebPrompt): boolean => {
+    if (parsed._compactionRequest && !compiled.multipart
+      && chatGptPromptJsonBytes(compiled.text) > CHATGPT_COMPACTION_PROMPT_JSON_BYTE_BUDGET) return false;
     const messages = compiledChatGptWebMessages(compiled);
     // Inert stages may use any explicitly available staging effort; execution keeps the chosen
     // effort. These are the widest stage modes used by the browser's existing selector.
@@ -110,6 +110,14 @@ export function resolveBiggerContextMultipartParts(
     return estimateCompiledChatGptWebInputTokens(compiled, parsed.modelId)
       < contextWindow * Math.min(messages.length, CHATGPT_WEB_BIGGER_CONTEXT_MULTIPLIER);
   };
+  const inline = compile();
+  if (parsed._compactionRequest) {
+    if (fits(inline)) return undefined;
+    return fits(compile(2)) ? 2 : CHATGPT_BIGGER_CONTEXT_PARTS;
+  }
+  const inputTokens = estimateCompiledChatGptWebInputTokens(inline, parsed.modelId);
+  const initialParts = biggerContextPartCount(inputTokens, autoCompactTokenLimit, false);
+  if (initialParts === CHATGPT_BIGGER_CONTEXT_PARTS) return initialParts;
   if (initialParts === undefined && fits(inline)) return undefined;
   return fits(compile(2)) ? 2 : CHATGPT_BIGGER_CONTEXT_PARTS;
 }

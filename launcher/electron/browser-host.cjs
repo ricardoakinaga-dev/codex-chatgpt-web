@@ -3032,10 +3032,10 @@ class BrowserHost {
   async withManualOperation(name, action) {
     await this.ready();
     if (this.activeTraceId) {
-      throw new Error(`ChatGPT browser is running Codex turn ${this.activeTraceId}`);
+      throw Object.assign(new Error(`ChatGPT browser is running Codex turn ${this.activeTraceId}`), { code: "browser_busy" });
     }
     if (this.manualOperation) {
-      throw new Error(`ChatGPT browser is already busy with ${this.manualOperation}`);
+      throw Object.assign(new Error(`ChatGPT browser is already busy with ${this.manualOperation}`), { code: "browser_busy" });
     }
     this.activateHomeSurface();
     this.manualOperation = name;

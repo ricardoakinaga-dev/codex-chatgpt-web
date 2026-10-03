@@ -8,6 +8,7 @@ import { getServiceStatus } from "./service";
 import { tunnelStatus } from "./tunnel";
 import { getTunnelServiceStatus } from "./tunnel-service";
 import {
+  LauncherBrowserBusyError,
   inspectLauncherBrowserHost,
   inspectLauncherBrowserHostLiveness,
   readLauncherBrowserHostDescriptor,
@@ -126,8 +127,10 @@ export async function runDoctor(): Promise<DoctorReport> {
     } catch (error) {
       checks.push({
         id: "browser-host",
-        status: "error",
-        message: "Embedded launcher browser is unavailable",
+        status: error instanceof LauncherBrowserBusyError ? "warning" : "error",
+        message: error instanceof LauncherBrowserBusyError
+          ? "Embedded launcher browser is busy; session inspection deferred until the active operation finishes"
+          : "Embedded launcher browser is unavailable",
         detail: error instanceof Error ? error.message : String(error),
       });
     }

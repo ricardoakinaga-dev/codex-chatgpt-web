@@ -1,0 +1,70 @@
+{
+  "schemaVersion": 1,
+  "project": "codex-chatgpt-web",
+  "version": "6.1.3",
+  "baseCommit": "18603c6",
+  "reviewMode": "single-agent, temporally separated self-review",
+  "scope": "Linux source candidate; installed runtime assessed separately",
+  "rawEvidenceDirectory": "/tmp/opencode/auditoria-profunda-2026-09-30",
+  "verification": {
+    "command": "bun run verify",
+    "startedAt": "2026-09-30T06:43:30.170Z",
+    "finishedAt": "2026-09-30T06:45:59.379Z",
+    "exitCode": 0,
+    "core": { "passed": 885, "skipped": 22, "failed": 0, "total": 907 },
+    "launcher": { "passed": 370, "skipped": 1, "failed": 0, "total": 371 },
+    "dependencyAudit": { "corePackages": 108, "launcherPackages": 351, "reportedVulnerabilities": 0 },
+    "typechecks": "passed for core TS and launcher renderer TS",
+    "runtimeSmoke": "RELOCATABLE_RUNTIME_SMOKE_OK",
+    "limitations": ["not deployed", "Windows/macOS not executed locally", "no line-coverage measurement", "Electron CJS excluded from TS typecheck"]
+  },
+  "baseline": {
+    "core": { "passed": 873, "skipped": 22, "failed": 0 },
+    "launcher": { "passed": 369, "skipped": 1, "failed": 0 },
+    "dependencyAudit": {
+      "core": { "reportedVulnerabilities": 7, "high": 2, "moderate": 5 },
+      "launcher": { "reportedVulnerabilities": 25, "high": 11, "moderate": 10, "low": 4 },
+      "note": "counts overlap across dependency graphs; no direct exploit was established"
+    }
+  },
+  "controlledCDPExperiment": {
+    "ownedPageResponsive": true,
+    "connectionWhileUnrelatedRendererBlocked": "failed",
+    "error": "browserType.connectOverCDP: Timeout 1500ms exceeded.",
+    "blockedConnectionMs": 1504.935908,
+    "connectionAfterBlockedPageClosed": "connected",
+    "status": "confirmed remaining limitation",
+    "isolation": "separate headless Chrome; no production session used"
+  },
+  "queueBenchmark": {
+    "runtime": "Bun 1.4.0",
+    "samplesPerSize": 5,
+    "medianDrainMs": { "50000": 6.913366, "100000": 12.97173 },
+    "decision": "do not rewrite Array.shift as a speculative performance optimization",
+    "limitation": "local synthetic queue only; not ChatGPT end-to-end latency"
+  },
+  "scoreRubric": { "correctness": 30, "failureRecovery": 25, "verification": 20, "operations": 15, "maintainability": 10 },
+  "scores": [
+    { "area": "Architecture", "before": 74, "afterParts": [24, 19, 14, 10, 7], "after": 74 },
+    { "area": "API and HTTP", "before": 82, "afterParts": [28, 23, 18, 14, 8], "after": 91 },
+    { "area": "Streaming", "before": 86, "afterParts": [28, 23, 18, 12, 7], "after": 88 },
+    { "area": "Compaction", "before": 79, "afterParts": [26, 20, 19, 9, 5], "after": 79 },
+    { "area": "Browser and CDP", "before": 64, "afterParts": [21, 13, 17, 8, 5], "after": 64 },
+    { "area": "MCP and tools", "before": 88, "afterParts": [29, 23, 19, 10, 7], "after": 88 },
+    { "area": "Security", "before": 75, "afterParts": [27, 21, 17, 13, 8], "after": 86 },
+    { "area": "Persistence and memory", "before": 73, "afterParts": [27, 22, 17, 10, 7], "after": 83 },
+    { "area": "Lifecycle and recovery", "before": 85, "afterParts": [28, 22, 19, 10, 6], "after": 85 },
+    { "area": "Performance", "before": 70, "afterParts": [22, 17, 13, 13, 9], "after": 74 },
+    { "area": "Observability", "before": 70, "afterParts": [27, 21, 17, 11, 7], "after": 83 },
+    { "area": "UX and accessibility", "before": 68, "afterParts": [25, 18, 15, 12, 8], "after": 78 },
+    { "area": "Tests and CI", "before": 87, "afterParts": [27, 23, 19, 13, 9], "after": 91 },
+    { "area": "Dependencies", "before": 43, "afterParts": [28, 23, 18, 13, 8], "after": 90 },
+    { "area": "Packaging and documentation", "before": 85, "afterParts": [27, 22, 18, 11, 7], "after": 85 }
+  ],
+  "average": { "before": 75.3, "after": 82.6, "method": "arithmetic mean, rounded to one decimal; subjective engineering assessment" },
+  "deployment": {
+    "newAuditChangesInstalled": false,
+    "installedRuntimeDependencyWarningsRemain": 7,
+    "previousCompactionRepair": "installed in prior task; not complete isolation of CDP bootstrap"
+  }
+}

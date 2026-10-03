@@ -534,6 +534,14 @@ process.once("SIGINT", () => {
 process.once("SIGTERM", () => {
   void requestShutdown();
 });
+// The helper multiplexes every concurrent browser turn. A stray rejection (for example an aborted
+// progress wait whose loser promise nobody awaited) must not kill the process: that aborts every
+// in-flight turn at once and surfaces to Codex as "ChatGPT stopped responding after the task started".
+process.on("unhandledRejection", reason => {
+  stderr.write(
+    `[chatgpt-web-helper] unhandled rejection (helper kept alive): ${reason instanceof Error ? reason.stack ?? reason.message : String(reason)}\n`,
+  );
+});
 
 // Advertise the optional frames this helper understands so the daemon can negotiate them explicitly.
 writeProtocol({ type: "ready", features: ["progress", "tool-boundary-ack", "completion-fence", "multipart-stage-ack", "skill-attachments", "text-reset"] });

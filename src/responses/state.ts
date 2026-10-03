@@ -28,7 +28,7 @@ let storedResponseBytes = 0;
 function measuredEntry(entry: Omit<StoredResponseState, "sizeBytes">): StoredResponseState {
   let sizeBytes = 0;
   try {
-    sizeBytes = JSON.stringify(entry.items).length;
+    sizeBytes = Buffer.byteLength(JSON.stringify(entry.items), "utf8");
   } catch {
     /* unserializable items: weightless rather than fatal */
   }
@@ -116,7 +116,7 @@ function persistNow(path: string): void {
       const [id, state] = entry;
       const { sizeBytes: _sizeBytes, ...persistable } = state;
       const persistEntry: [string, StoredResponseState] = [id, persistable];
-      const size = JSON.stringify(persistEntry).length;
+      const size = Buffer.byteLength(JSON.stringify(persistEntry), "utf8");
       if (size > SNAPSHOT_ENTRY_MAX_BYTES) continue;
       if (total + size > SNAPSHOT_TOTAL_MAX_BYTES) break;
       total += size;

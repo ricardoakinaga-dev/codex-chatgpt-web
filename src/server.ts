@@ -20,7 +20,7 @@ import { bridgeToResponsesSSE, buildResponseJSON, formatErrorResponse } from "./
 import type { AppConfig } from "./config";
 import { providerConfig } from "./config";
 import { AsyncEventQueue } from "./event-queue";
-import { readJsonRequestBody } from "./http-body";
+import { readJsonRequestBody, RequestBodyLimitError } from "./http-body";
 import { httpStatusFromTerminalError } from "./lib/errors";
 import { createHash } from "node:crypto";
 import { augmentNativeModelCatalog } from "./model-catalog";
@@ -488,8 +488,10 @@ export async function responseRequest(
   try {
     raw = await readJsonRequestBody(req);
   } catch (error) {
+    void req.body?.cancel(error).catch(() => {});
+    void nativeRequest.body?.cancel(error).catch(() => {});
     return formatErrorResponse(
-      400,
+      error instanceof RequestBodyLimitError ? 413 : 400,
       "invalid_request_error",
       error instanceof Error ? error.message : "Request body must be valid JSON",
     );
@@ -512,6 +514,7 @@ export async function responseRequest(
       return formatErrorResponse(502, "upstream_error", error instanceof Error ? error.message : String(error));
     }
   }
+  void nativeRequest.body?.cancel().catch(() => {});
   const requestedPreviousResponseId = raw && typeof raw === "object" && !Array.isArray(raw)
     ? (raw as { previous_response_id?: unknown }).previous_response_id
     : undefined;
@@ -728,8 +731,10 @@ export async function compactRequest(
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
     raw = parsed as Record<string, unknown>;
   } catch (error) {
+    void req.body?.cancel(error).catch(() => {});
+    void nativeRequest.body?.cancel(error).catch(() => {});
     return formatErrorResponse(
-      400,
+      error instanceof RequestBodyLimitError ? 413 : 400,
       "invalid_request_error",
       error instanceof Error ? error.message : "Compaction request body must be a JSON object",
     );
@@ -768,6 +773,7 @@ export async function compactRequest(
       return formatErrorResponse(502, "upstream_error", error instanceof Error ? error.message : String(error));
     }
   }
+  void nativeRequest.body?.cancel().catch(() => {});
   let route: ChatGptWebModelRoute;
   try {
     route = requireChatGptWebModelRoute(raw.model, config);

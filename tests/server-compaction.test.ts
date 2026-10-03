@@ -539,7 +539,12 @@ test("rejects Pro-only routed models before opening a browser when the account h
   }
 });
 
-test("preserves a structured browser preflight failure through the v1 compaction endpoint", async () => {
+test.each([
+  { message: "This task exceeds the ChatGPT Web context window.", status: 400,
+    errorType: "invalid_request_error", code: "context_length_exceeded" },
+  { message: "ChatGPT browser stage timed out: browser_page", status: 504,
+    errorType: "server_error", code: "chatgpt_browser_stage_timeout" },
+])("preserves a structured $code failure through the v1 compaction endpoint", async failure => {
   const response = await compactRequest(new Request("http://127.0.0.1:17841/v1/responses/compact", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -549,21 +554,18 @@ test("preserves a structured browser preflight failure through the v1 compaction
     async runTurn(_parsed, _incoming, emit) {
       emit({
         type: "error",
-        message: "This task exceeds the ChatGPT Web context window.",
-        status: 400,
-        errorType: "invalid_request_error",
-        code: "context_length_exceeded",
+        ...failure,
         retryable: false,
       });
     },
   }));
 
-  expect(response.status).toBe(400);
+  expect(response.status).toBe(failure.status);
   expect(await response.json()).toEqual({
     error: {
-      message: "This task exceeds the ChatGPT Web context window.",
-      type: "invalid_request_error",
-      code: "context_length_exceeded",
+      message: failure.message,
+      type: failure.errorType,
+      code: failure.code,
     },
   });
 });

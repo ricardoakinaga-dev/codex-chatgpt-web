@@ -3,6 +3,31 @@ const assert = require("node:assert/strict");
 const { BrowserHost } = require("../electron/browser-host.cjs");
 const { BrowserControlServer } = require("../electron/control-server.cjs");
 
+test("busy session inspection returns a typed conflict without touching the active browser", async () => {
+  let inspected = false;
+  const host = {
+    browserInteractionMode: () => "automatic",
+    inspectSession: () => BrowserHost.prototype.withManualOperation.call({
+      ready: async () => {}, activeTraceId: "busy_trace_123",
+    }, "session inspection", async () => { inspected = true; }),
+  };
+  const server = await new BrowserControlServer({
+    logger: { info() {}, warn() {}, error() {} }, getPreferences: () => ({}), getBrowserHost: () => host,
+  }).start();
+  try {
+    const { endpoint, token } = server.descriptor();
+    const response = await fetch(`${endpoint}/v1/session/inspect`, {
+      method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ detectCapabilities: false }),
+    });
+    assert.equal(response.status, 409);
+    assert.equal((await response.json()).code, "browser_busy");
+    assert.equal(inspected, false);
+  } finally {
+    await server.close();
+  }
+});
+
 test("disconnect cancels pending browser initialization and destroys only its owned document", async () => {
   const { EventEmitter } = require("node:events");
   for (const stalledAt of ["load", "mark"]) {

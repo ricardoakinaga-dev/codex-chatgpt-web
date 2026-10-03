@@ -843,6 +843,32 @@ export async function throwIfChatGptSessionFailureAlert(page: Page): Promise<voi
   );
 }
 
+/** The signed-out lightweight UI is not the authenticated composer, even though it has a textarea. */
+export async function throwIfChatGptSignedOutComposer(page: Page, signal?: AbortSignal): Promise<void> {
+  try {
+    if (new URL(page.url()).origin !== "https://chatgpt.com"
+      || !await withBrowserTurnAbort(withChatGptBrowserObservationTimeout(
+        page.locator("#mobile-composer-prompt").isVisible(), 1_000,
+      ), signal)) return;
+  } catch { throwIfPromptAttachmentAborted(signal); return; }
+  const evidence = await withBrowserTurnAbort(withChatGptBrowserObservationTimeout(page.evaluate(async () => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 2_000);
+    try {
+      const response = await fetch("/api/auth/session", { credentials: "include", signal: controller.signal });
+      const body = await response.json();
+      return { status: response.status, hasUser: Boolean(body.user), hasAccessToken: typeof body.accessToken === "string" && body.accessToken.length > 0 };
+    } catch { return undefined; }
+    finally { clearTimeout(timer); }
+  }), 3_000), signal);
+  if (evidence && (evidence.status === 401 || (evidence.status === 200 && !evidence.hasUser && !evidence.hasAccessToken))) {
+    throw new ChatGptWebAdapterError(
+      "ChatGPT is signed out in the launcher browser. Sign in inside Codex Web GPT, then resume this task.",
+      { status: 401, errorType: "authentication_error", code: "chatgpt_sign_in_required", retryable: false },
+    );
+  }
+}
+
 const chatGptTerminalErrorAlert = (scope: ChatGptTextScope): Locator => scope
   .getByText(/Something went wrong[\s\S]*help\.openai\.com/i)
   .last();
@@ -2441,7 +2467,12 @@ export class ChatGptBrowserWorker {
           }
           stageTimedOut = true;
           controller.abort();
-          rejectTimeout(new Error(`ChatGPT browser stage timed out: ${stage}`));
+          rejectTimeout(new ChatGptWebAdapterError(`ChatGPT browser stage timed out: ${stage}`, {
+            status: 504,
+            errorType: "server_error",
+            code: "chatgpt_browser_stage_timeout",
+            retryable: false,
+          }));
         };
         timer = setTimeout(fireOrRearm, timeoutMs);
       });
@@ -2753,6 +2784,7 @@ export class ChatGptBrowserWorker {
     const composers = page.locator(CHATGPT_COMPOSER_SELECTOR).filter({ visible: true });
     const deadline = Date.now() + timeoutMs;
     let count = 0;
+    let guestProbeAfter = 0;
     while (Date.now() < deadline) {
       throwIfPromptAttachmentAborted(abortSignal);
       count = await withBrowserTurnAbort(
@@ -2763,17 +2795,22 @@ export class ChatGptBrowserWorker {
         abortSignal,
       );
       if (count === 1) return composers.first();
+      if (count === 0 && Date.now() >= guestProbeAfter) {
+        guestProbeAfter = Date.now() + 1_000;
+        await throwIfChatGptSignedOutComposer(page, abortSignal);
+      }
       await withBrowserTurnAbort(
         new Promise(resolveSleep => setTimeout(resolveSleep, 50)),
         abortSignal,
       );
     }
     throw new ChatGptWebAdapterError(
-      "ChatGPT composer did not appear. Reload the ChatGPT tab and retry the task.",
+      count > 1 ? "ChatGPT exposed multiple visible composers; refusing to select an ambiguous input."
+        : "ChatGPT composer did not appear. Reload the ChatGPT tab and retry the task.",
       {
         status: 502,
         errorType: "server_error",
-        code: "chatgpt_composer_unavailable",
+        code: count > 1 ? "chatgpt_composer_ambiguous" : "chatgpt_composer_unavailable",
         retryable: false,
         cause: new Error(`Visible ChatGPT composer count was ${count}`),
       },
@@ -2785,41 +2822,62 @@ export class ChatGptBrowserWorker {
     page: Page,
     captureDiagnostic?: (checkpoint: string) => Promise<void>,
     useSavedChats = false,
+    abortSignal?: AbortSignal,
   ): Promise<Locator> {
     // Launcher verification refreshes its owned page before attaching Playwright so a newly added
     // connector is present in the catalog. Navigating again here destroys that freshly hydrated
     // document and made the first verification race a second SPA bootstrap. A leased turn starts on
     // about:blank and therefore still performs exactly one navigation through this same method.
     const targetUrl = chatGptNewChatUrl(useSavedChats);
+    throwIfPromptAttachmentAborted(abortSignal);
     if (page.url() !== targetUrl) {
-      await page.goto(targetUrl, {
+      await withBrowserTurnAbort(page.goto(targetUrl, {
         waitUntil: "domcontentloaded",
-        timeout: 60_000,
-      });
+        timeout: 20_000,
+      }), abortSignal);
       await captureDiagnostic?.(useSavedChats ? "saved-chat-navigation-complete" : "temporary-chat-navigation-complete");
     }
-    // Merged: robust 60s hydration wait (local) with upstream login-ownership semantics.
-    // A failed page read is not evidence of an expired login. Session evidence stays
-    // authoritative: a real expired-login finding replaces the composer failure, typed
-    // adapter errors propagate untouched, and anything else becomes a retryable
-    // pre-submission UI failure with the original error preserved as cause.
-    // The authenticated-session check below owns login failures.
-    let composer: Locator;
-    try {
-      // New Chat can hydrate slowly when several browser turns are active.
-      composer = await this.activeComposer(page, 60_000);
-    } catch (cause) {
-      if (cause instanceof ChatGptWebAdapterError) throw cause;
-      try {
-        await throwIfChatGptSessionFailureAlert(page);
-      } catch (alertError) {
-        if (alertError instanceof ChatGptWebAdapterError) throw alertError;
+    // Hydration normally finishes in a few seconds. One bounded recovery is allowed only before
+    // any message exists on this new chat; neither retained history nor an ambiguous input is
+    // ever reloaded. Account errors and operator cancellation remain authoritative.
+    const acquire = async (): Promise<Locator> => {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          return await this.activeComposer(page, attempt === 0 ? 8_000 : 20_000, abortSignal);
+        } catch (cause) {
+          throwIfPromptAttachmentAborted(abortSignal);
+          try {
+            await withBrowserTurnAbort(withChatGptBrowserObservationTimeout(throwIfChatGptSessionFailureAlert(page)), abortSignal);
+            await withBrowserTurnAbort(withChatGptBrowserObservationTimeout(throwIfChatGptRateLimitDialog(page)), abortSignal);
+          } catch (alertError) {
+            throwIfPromptAttachmentAborted(abortSignal);
+            if (alertError instanceof ChatGptWebAdapterError) throw alertError;
+          }
+          const recoverable = cause instanceof ChatGptBrowserObservationTimeoutError
+            || (cause instanceof ChatGptWebAdapterError && cause.code === "chatgpt_composer_unavailable");
+          let empty = false;
+          if (attempt === 0 && recoverable && page.url() === targetUrl) {
+            try {
+              empty = await withBrowserTurnAbort(withChatGptBrowserObservationTimeout(
+                page.locator(`${CHATGPT_USER_TURN_SELECTOR}, ${CHATGPT_ASSISTANT_TURN_SELECTOR}`).count(), 1_000,
+              ), abortSignal) === 0;
+            } catch { throwIfPromptAttachmentAborted(abortSignal); }
+          }
+          if (empty) {
+            await captureDiagnostic?.("empty-chat-composer-recovery");
+            await withBrowserTurnAbort(page.reload({ waitUntil: "domcontentloaded", timeout: 20_000 }), abortSignal);
+            continue;
+          }
+          if (cause instanceof ChatGptWebAdapterError) throw cause;
+          throw new ChatGptWebAdapterError(
+            "ChatGPT did not make the new chat composer available. Reload ChatGPT and retry the task.",
+            { status: 502, errorType: "server_error", code: "chatgpt_surface_unavailable", retryable: true, cause },
+          );
+        }
       }
-      throw new ChatGptWebAdapterError(
-        "ChatGPT did not make the new chat composer available. Reload ChatGPT and retry the task.",
-        { status: 502, errorType: "server_error", code: "chatgpt_surface_unavailable", retryable: true, cause },
-      );
-    }
+      throw new Error("ChatGPT composer recovery exhausted");
+    };
+    const composer = await acquire();
     if (!useSavedChats && await dismissChatGptTemporaryChatOnboarding(page)) {
       await captureDiagnostic?.("temporary-chat-onboarding-dismissed");
     }
@@ -4113,13 +4171,21 @@ export class ChatGptBrowserWorker {
     return { effort: mode.displayLabel, response: CHATGPT_SMOKE_EXPECTED };
   }
 
-  private async attachFiles(page: Page, prompt: CompiledChatGptWebPrompt): Promise<void> {
+  private async attachFiles(page: Page, prompt: CompiledChatGptWebPrompt, abortSignal?: AbortSignal): Promise<void> {
     const files = chatGptPromptFilePayloads(prompt);
     if (files.length === 0) return;
-    const composer = await this.activeComposer(page);
+    const composer = await this.activeComposer(page, 30_000, abortSignal);
     const composerForm = composer.locator("xpath=ancestor::form[1]");
     const input = page.locator('input[data-testid="upload-photos-input"], form[data-chatgpt-composer] input[type="file"][multiple]:not([accept])');
-    await input.waitFor({ state: "attached", timeout: 20_000 });
+    // runStage owns the file_attachment budget. A second Locator timeout would silently collapse
+    // the 120-second stage back to 20 seconds whenever the composer needs longer to mount its
+    // file input (heavy conversations do), so the wait runs for the stage budget and is cancelled
+    // by the stage signal instead.
+    await input.waitFor({
+      state: "attached",
+      timeout: browserStageTimeouts.fileAttachment,
+      ...(abortSignal ? { signal: abortSignal } : {}),
+    });
     await input.setInputFiles(files);
     try {
       await Promise.all(files.map(file => (
@@ -5102,10 +5168,11 @@ export class ChatGptBrowserWorker {
           turn.traceId,
           "temporary_chat_preparation",
           browserStageTimeouts.temporaryChatPreparation,
-          () => this.prepareChatSurface(
+          stageSignal => this.prepareChatSurface(
             page,
             checkpoint => diagnostics.capture(page, checkpoint),
             this.config.useSavedChats,
+            turn.abortSignal ? AbortSignal.any([stageSignal, turn.abortSignal]) : stageSignal,
           ),
         );
       }
@@ -5311,12 +5378,14 @@ export class ChatGptBrowserWorker {
             turn.traceId,
             "connector_catalog_refresh",
             browserStageTimeouts.temporaryChatPreparation,
-            async () => {
-              await page.reload({ waitUntil: "domcontentloaded", timeout: 60_000 });
+            async stageSignal => {
+              const signal = turn.abortSignal ? AbortSignal.any([stageSignal, turn.abortSignal]) : stageSignal;
+              await withBrowserTurnAbort(page.reload({ waitUntil: "domcontentloaded", timeout: 20_000 }), signal);
               await this.prepareChatSurface(
                 page,
                 checkpoint => diagnostics.capture(page, checkpoint),
                 this.config.useSavedChats,
+                signal,
               );
               mode = await this.selectModelAndEffort(
                 page,
@@ -5334,8 +5403,8 @@ export class ChatGptBrowserWorker {
         }
       }
       await diagnostics.capture(page, "prompt-attachment-complete");
-      await this.runStage(turn.traceId, "file_attachment", browserStageTimeouts.fileAttachment, () => (
-        this.attachFiles(page, prepared)
+      await this.runStage(turn.traceId, "file_attachment", browserStageTimeouts.fileAttachment, (stageSignal) => (
+        this.attachFiles(page, prepared, stageSignal)
       ));
       await diagnostics.capture(page, "file-attachment-complete");
       const completionTracker = new ChatGptCompletionTracker();

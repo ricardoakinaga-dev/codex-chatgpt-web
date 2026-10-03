@@ -163,6 +163,31 @@ descriptions. This updates the compaction tool contract; it does not remove safe
 If compaction ends without a submitted summary, the launcher reports that failure and preserves
 the existing task history.
 
+### New-chat composer recovery and isolated browser connections
+
+An empty new chat whose composer does not hydrate gets one bounded pre-send reload. The first
+hydration window is eight seconds; recovery has a twenty-second composer window. Existing
+conversation messages, ambiguous composers, expired sessions, rate limits and cancellation do
+not trigger this recovery. It never resubmits an accepted message.
+
+Launcher CDP connections now attach to the exact leased target and its descendant frames/workers,
+so another task's stalled renderer does not block initial connection. Closing one connection
+disconnects that lease without closing the launcher or another task's tab.
+
+With Bigger Context enabled, compaction selects one, two or six messages based on complete-context
+fit. Small checkpoints no longer incur five inert acknowledgement rounds; larger inputs retain
+their complete records and use multipart when needed. No history is trimmed to obtain the faster
+one-message path.
+
+If Codex reports `Error running remote compact task` with `ChatGPT did not complete the context
+handoff`, check the launcher log for the underlying browser stage. `browser_page` means acquisition
+of the owned ChatGPT tab timed out, before the summary request could be sent. A stalled CDP probe
+on another tab can block acquisition; page selection now bounds those probes and does not wait
+for unrelated session cleanup. Browser stage timeouts retain their stage and
+`chatgpt_browser_stage_timeout` code instead of becoming the generic handoff error. Restart the
+launcher after installing the fix, then resume the same Codex task and retry compaction. The failed
+handoff does not replace its saved history.
+
 ### Tools disappear on follow-up messages
 
 If local tools work on the first message but disappear on a follow-up, check the same ChatGPT tab

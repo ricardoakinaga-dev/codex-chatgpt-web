@@ -42,8 +42,10 @@ export class AsyncEventQueue<T> implements AsyncIterable<T> {
   [Symbol.asyncIterator](): AsyncIterator<T> {
     return {
       next: () => {
-        const value = this.buffered.shift();
-        if (value !== undefined) return Promise.resolve({ value, done: false });
+        if (this.buffered.length > 0) {
+          const value = this.buffered.shift() as T;
+          return Promise.resolve({ value, done: false });
+        }
         if (this.closed) return Promise.resolve({ value: undefined, done: true });
         return new Promise(resolve => this.waiters.push(resolve));
       },

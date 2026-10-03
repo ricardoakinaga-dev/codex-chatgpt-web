@@ -357,9 +357,10 @@ class BrowserControlServer {
       const manualInspectionDisabled = error?.code === "manual_browser_inspection_disabled";
       const manualOwnerLost = error?.code === "manual_turn_owner_lost";
       const manualTimedOut = error?.code === "manual_turn_timed_out";
+      const browserBusy = error?.code === "browser_busy";
       writeJson(
         response,
-        cancelled || retainedUnavailable || manualInspectionDisabled || manualOwnerLost
+        cancelled || retainedUnavailable || manualInspectionDisabled || manualOwnerLost || browserBusy
           ? 409
           : manualTimedOut ? 408 : 400,
         {
@@ -369,6 +370,7 @@ class BrowserControlServer {
         ...(manualInspectionDisabled ? { code: "manual_browser_inspection_disabled" } : {}),
         ...(manualOwnerLost ? { code: "manual_turn_owner_lost" } : {}),
         ...(manualTimedOut ? { code: "manual_turn_timed_out" } : {}),
+        ...(browserBusy ? { code: "browser_busy" } : {}),
         },
       );
     }

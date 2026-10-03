@@ -61,7 +61,7 @@ export function App() {
       if (next.operation?.status === "failed" && next.operation.name !== "mcp-verification") {
         setError(next.operation.message);
       }
-    }).catch((cause) => setError(messageOf(cause)));
+    }).catch((cause) => { if (!cancelled) setError(messageOf(cause)); });
     const unsubscribeState = api.onStateChanged((state) => {
       setSnapshot((current) => current
         ? {
@@ -107,7 +107,9 @@ export function App() {
   }, []);
 
   if (!api) return <FatalMessage message="Launcher IPC is unavailable." />;
-  if (!snapshot) return <LaunchLoading />;
+  if (!snapshot) return error
+    ? <FatalMessage message={error} onReload={() => window.location.reload()} />
+    : <LaunchLoading />;
 
   const language = snapshot.state.language ?? "en";
   const copy = copyFor(language, snapshot.connectorNames);
@@ -2647,12 +2649,13 @@ function LaunchLoading() {
   );
 }
 
-function FatalMessage({ message }: { message: string }) {
+function FatalMessage({ message, onReload }: { message: string; onReload?: () => void }) {
   return (
-    <main className="fatal-message">
+    <main className="fatal-message" role="alert">
       <BrandMark />
       <h1>Codex Web GPT</h1>
       <p>{message}</p>
+      {onReload ? <button className="button-primary" onClick={onReload} type="button">Reload launcher</button> : null}
     </main>
   );
 }

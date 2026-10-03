@@ -454,6 +454,12 @@ test("browser stage timeout aborts late page acquisition", async () => {
   );
 
   await expect(result).rejects.toThrow("ChatGPT browser stage timed out: browser_page");
+  await expect(result).rejects.toMatchObject({
+    status: 504,
+    errorType: "server_error",
+    code: "chatgpt_browser_stage_timeout",
+    retryable: false,
+  });
   expect(acquisitionAborted).toBeTrue();
 });
 
@@ -2453,7 +2459,7 @@ test("image attachment readiness uses exact file tiles and not localized remove-
   };
   const input = {
     waitFor: async (state: { state: string; timeout: number }) => {
-      expect(state).toEqual({ state: "attached", timeout: 20_000 });
+      expect(state).toEqual({ state: "attached", timeout: 120_000 });
       calls.push(["inputReady"]);
     },
     setInputFiles: async (files: Array<{ name: string }>) => {
@@ -2956,7 +2962,7 @@ test.each([
   const page = Object.assign(dialogPage(alert).page, { url: () => CHATGPT_TEMPORARY_CHAT_URL });
   const worker = Object.assign(Object.create(ChatGptBrowserWorker.prototype), {
     activeComposer: async (_page: Page, timeoutMs: number) => {
-      expect(timeoutMs).toBe(60_000);
+      expect(timeoutMs).toBe(8_000);
       throw new Error("No visible composer after navigation");
     },
   }) as { prepareChatSurface(page: Page): Promise<unknown> };

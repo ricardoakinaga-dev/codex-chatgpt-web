@@ -4,6 +4,7 @@ import { chromium, type Browser, type BrowserContext, type Page } from "playwrig
 import { ChatGptWebAdapterError } from "./adapters/chatgpt-web/adapter-error";
 import { expandUserPath } from "./config";
 import { processRunning } from "./process";
+import { ScopedCdpTransport } from "./scoped-cdp-transport";
 
 function launcherUnavailableError(message: string, cause?: unknown): ChatGptWebAdapterError {
   return new ChatGptWebAdapterError(message, {
@@ -23,6 +24,13 @@ export class LauncherBrowserTurnCancelledError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "LauncherBrowserTurnCancelledError";
+  }
+}
+
+export class LauncherBrowserBusyError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LauncherBrowserBusyError";
   }
 }
 
@@ -188,17 +196,21 @@ export function readLauncherBrowserHostDescriptor(configuredPath: string): Launc
   return descriptor;
 }
 
-async function assertCdpReady(descriptor: LauncherBrowserHostDescriptor, timeoutMs: number): Promise<void> {
+async function assertCdpReady(descriptor: LauncherBrowserHostDescriptor, timeoutMs: number, signal?: AbortSignal): Promise<string> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(`${descriptor.endpoint}/json/version`, { signal: controller.signal });
+    const response = await fetch(`${descriptor.endpoint}/json/version`, {
+      signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal,
+    });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const body = await response.json() as Record<string, unknown>;
     if (typeof body.webSocketDebuggerUrl !== "string" || !body.webSocketDebuggerUrl.startsWith("ws://127.0.0.1:")) {
       throw new Error("CDP metadata did not expose a loopback WebSocket endpoint");
     }
+    return body.webSocketDebuggerUrl;
   } catch (error) {
+    if (signal?.aborted) throw new DOMException("Launcher browser connection aborted", "AbortError");
     throw new Error(`Launcher browser CDP endpoint is not ready: ${error instanceof Error ? error.message : String(error)}`);
   } finally {
     clearTimeout(timer);
@@ -235,6 +247,56 @@ export async function selectLauncherPage(
   const targetId = descriptor.surfaceTargets[surfaceId];
   if (!targetId) throw new Error("Launcher browser surface is no longer registered with its native target");
   const deadline = Date.now() + timeoutMs;
+  // Probe each Page only once per acquisition. A pending CDP attachment/metadata request on an
+  // unrelated renderer must neither consume the entire browser stage nor accumulate sessions on
+  // every poll. The owning Browser connection releases any still-pending probes when it closes.
+  const probes = new Map<Page, Promise<string | undefined>>();
+  const probe = (context: BrowserContext, page: Page): Promise<string | undefined> => {
+    let pending = probes.get(page);
+    if (!pending) {
+      pending = (async () => {
+        const session = await context.newCDPSession(page).catch(() => undefined);
+        if (!session) return undefined;
+        try {
+          if (abortSignal?.aborted) return undefined;
+          const { targetInfo } = await session.send("Target.getTargetInfo");
+          return targetInfo.targetId;
+        } catch {
+          return undefined;
+        } finally {
+          // Detachment is cleanup, not ownership evidence. Waiting here can block an otherwise
+          // proved owned page behind another tab's renderer. Also runs for a late attachment.
+          void session.detach().catch(() => {});
+        }
+      })();
+      probes.set(page, pending);
+      const current = pending;
+      void current.then(value => {
+        if (value === undefined && probes.get(page) === current) probes.delete(page);
+      });
+    }
+    return pending;
+  };
+  const boundedProbe = async (pending: Promise<string | undefined>): Promise<string | undefined> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let onAbort: (() => void) | undefined;
+    try {
+      return await Promise.race([
+        pending,
+        new Promise<undefined>((resolve) => {
+          timer = setTimeout(() => resolve(undefined), Math.max(0, Math.min(5_000, deadline - Date.now())));
+        }),
+        new Promise<never>((_resolve, reject) => {
+          onAbort = () => reject(new DOMException("Launcher browser connection aborted", "AbortError"));
+          if (abortSignal?.aborted) onAbort();
+          else abortSignal?.addEventListener("abort", onAbort, { once: true });
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (onAbort) abortSignal?.removeEventListener("abort", onAbort);
+    }
+  };
   do {
     if (abortSignal?.aborted) {
       throw new DOMException("Launcher browser connection aborted", "AbortError");
@@ -242,18 +304,13 @@ export async function selectLauncherPage(
     const candidates = browser.contexts().flatMap(context => context.pages().map(page => ({ context, page })));
     // Target metadata belongs to the browser process. Evaluating every page here makes an
     // unrelated busy/paused renderer block acquisition of an already-responsive owned page.
-    const inspected = await Promise.all(candidates.map(async candidate => {
-      const session = await candidate.context.newCDPSession(candidate.page).catch(() => undefined);
-      if (!session) return { ...candidate, targetId: undefined };
-      try {
-        const { targetInfo } = await session.send("Target.getTargetInfo");
-        return { ...candidate, targetId: targetInfo.targetId };
-      } catch {
-        return { ...candidate, targetId: undefined };
-      } finally {
-        await session.detach().catch(() => {});
-      }
-    }));
+    const inspected = await Promise.all(candidates.map(async candidate => ({
+      ...candidate,
+      targetId: await boundedProbe(probe(candidate.context, candidate.page)),
+    })));
+    if (abortSignal?.aborted) {
+      throw new DOMException("Launcher browser connection aborted", "AbortError");
+    }
     const owned = inspected.filter(candidate => candidate.targetId === targetId);
     if (owned.length === 1) {
       return { context: owned[0].context, page: owned[0].page };
@@ -261,7 +318,9 @@ export async function selectLauncherPage(
     if (owned.length > 1) {
       throw new Error(`Launcher browser host exposed ${owned.length} surfaces with the same ownership id`);
     }
-    await new Promise(resolve => setTimeout(resolve, 100));
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await new Promise(resolve => setTimeout(resolve, Math.min(100, remaining)));
   } while (Date.now() < deadline);
   throw new Error("Launcher browser host did not expose its owned browser surface");
 }
@@ -276,15 +335,23 @@ export async function connectLauncherBrowserHost(
     throw new DOMException("Launcher browser connection aborted", "AbortError");
   }
   const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
-  await assertCdpReady(descriptor, Math.min(timeoutMs, 5_000));
+  const targetId = descriptor.surfaceTargets[surfaceId ?? descriptor.surfaceId];
+  if (!targetId) throw new Error("Launcher browser surface is no longer registered with its native target");
+  const deadline = Date.now() + timeoutMs;
+  const endpoint = await assertCdpReady(descriptor, Math.min(timeoutMs, 5_000), abortSignal);
+  const transport = new ScopedCdpTransport(endpoint, targetId);
+  const closeOnAbort = () => { void transport.close(); };
+  abortSignal?.addEventListener("abort", closeOnAbort, { once: true });
   let browser: Browser;
   try {
-    browser = await chromium.connectOverCDP(descriptor.endpoint, { timeout: timeoutMs });
+    if (abortSignal?.aborted) throw new DOMException("Launcher browser connection aborted", "AbortError");
+    browser = await chromium.connectOverCDP(transport, { timeout: Math.max(1, deadline - Date.now()), noDefaults: true });
   } catch (error) {
+    await transport.close();
+    abortSignal?.removeEventListener("abort", closeOnAbort);
+    if (abortSignal?.aborted) throw new DOMException("Launcher browser connection aborted", "AbortError");
     throw new Error(`Could not connect Playwright to the launcher browser: ${error instanceof Error ? error.message : String(error)}`);
   }
-  const closeOnAbort = () => { void browser.close().catch(() => {}); };
-  abortSignal?.addEventListener("abort", closeOnAbort, { once: true });
   try {
     if (abortSignal?.aborted) {
       throw new DOMException("Launcher browser connection aborted", "AbortError");
@@ -292,13 +359,26 @@ export async function connectLauncherBrowserHost(
     const { context, page } = await selectLauncherPage(
       browser,
       descriptor,
-      timeoutMs,
+      Math.max(1, deadline - Date.now()),
       surfaceId,
       abortSignal,
     );
+    // noDefaults avoids browser-wide overrides, but keyboard-driven ChatGPT controls need focus
+    // emulation on their leased target, including when the launcher window is in the background.
+    // Keep this CDP session until the owning connection closes; detachment removes its overrides.
+    let focusTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        context.newCDPSession(page).then(session => session.send("Emulation.setFocusEmulationEnabled", { enabled: true })),
+        new Promise<never>((_resolve, reject) => {
+          focusTimer = setTimeout(() => reject(new Error("Launcher browser focus preparation timed out")), Math.max(1, deadline - Date.now()));
+        }),
+      ]);
+    } finally { if (focusTimer) clearTimeout(focusTimer); }
     return { descriptor, browser, context, page };
   } catch (error) {
     await browser.close().catch(() => {});
+    if (abortSignal?.aborted) throw new DOMException("Launcher browser connection aborted", "AbortError");
     throw error;
   } finally {
     abortSignal?.removeEventListener("abort", closeOnAbort);
@@ -339,7 +419,16 @@ export async function inspectLauncherBrowserHost(
       signal: controller.signal,
     });
     const body = await response.json().catch(() => ({})) as Record<string, unknown>;
-    if (!response.ok) throw new Error(typeof body.error === "string" ? body.error : `HTTP ${response.status}`);
+    if (!response.ok) {
+      const message = typeof body.error === "string" ? body.error : `HTTP ${response.status}`;
+      // Older launchers did not publish the conflict code. Accept only their exact occupied-turn
+      // message and HTTP 400; upstream/server errors must remain failures even if they mention busy.
+      if ((response.status === 409 && body.code === "browser_busy")
+        || (response.status === 400 && /^ChatGPT browser is running Codex turn [A-Za-z0-9_-]{6,128}$/.test(message))) {
+        throw new LauncherBrowserBusyError(message);
+      }
+      throw new Error(message);
+    }
     if (body.authenticated !== true || body.temporary !== true || typeof body.url !== "string") {
       throw new Error("Launcher returned invalid ChatGPT session evidence");
     }
@@ -359,6 +448,7 @@ export async function inspectLauncherBrowserHost(
       } : {}),
     };
   } catch (error) {
+    if (error instanceof LauncherBrowserBusyError) throw error;
     const detail = timedOut
       ? `session inspection timed out after ${timeoutMs}ms`
       : error instanceof Error ? error.message : String(error);

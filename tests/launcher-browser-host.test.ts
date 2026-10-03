@@ -451,6 +451,49 @@ test("launcher page selection rejects duplicated native target ownership", async
   );
 });
 
+test.each(["attach", "metadata", "detach"])("a stalled unrelated CDP %s cannot block the owned page", async (stage) => {
+  const descriptor = readLauncherBrowserHostDescriptor(descriptorFile());
+  const unrelated = {} as Page;
+  const owned = {} as Page;
+  const never = () => new Promise<never>(() => {});
+  const context = {
+    pages: () => [unrelated, owned],
+    newCDPSession: async (page: Page) => {
+      if (page === unrelated && stage === "attach") return never();
+      return {
+        send: async () => page === unrelated && stage === "metadata"
+          ? never()
+          : { targetInfo: { targetId: page === owned ? "native-owned-target" : "other-target" } },
+        detach: async () => page === unrelated && stage === "detach" ? never() : undefined,
+      };
+    },
+  } as unknown as BrowserContext;
+  const browser = { contexts: () => [context] } as unknown as Browser;
+  await expect(selectLauncherPage(browser, descriptor, 40)).resolves.toEqual({ context, page: owned });
+}, 500);
+
+test("page acquisition cancellation interrupts a pending CDP probe and detaches a late session", async () => {
+  const descriptor = readLauncherBrowserHostDescriptor(descriptorFile());
+  const page = {} as Page;
+  let attach!: (session: unknown) => void;
+  let detached = false;
+  const context = {
+    pages: () => [page],
+    newCDPSession: () => new Promise(resolve => { attach = resolve; }),
+  } as unknown as BrowserContext;
+  const browser = { contexts: () => [context] } as unknown as Browser;
+  const controller = new AbortController();
+  const pending = selectLauncherPage(browser, descriptor, 60_000, undefined, controller.signal);
+  controller.abort();
+  await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+  attach({
+    send: async () => ({ targetInfo: { targetId: "native-owned-target" } }),
+    detach: async () => { detached = true; },
+  });
+  await Bun.sleep(0);
+  expect(detached).toBe(true);
+}, 500);
+
 test("launcher descriptor rejects ambiguous native targets and selection rejects retired surfaces", async () => {
   const path = descriptorFile();
   const descriptor = readLauncherBrowserHostDescriptor(path);

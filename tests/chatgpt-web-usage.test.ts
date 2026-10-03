@@ -55,15 +55,41 @@ test("multipart selection accounts for whole-record and composer fit before subm
   ).effort).toBe("max");
 }, 60_000);
 
-test("Bigger Context compaction selects six parts before the legacy inline byte budget", () => {
+test("small compaction fits one message without five needless acknowledgement rounds", () => {
+  const parsed = request("Summarize the completed work and preserve this checkpoint.");
+  parsed._compactionRequest = true;
+  expect(resolveBiggerContextMultipartParts(parsed, capabilities)).toBeUndefined();
+});
+
+test("Bigger Context compaction preserves an oversized inline record in two parts", () => {
   const parsed = request("x".repeat(160_000));
   parsed._compactionRequest = true;
   const parts = resolveBiggerContextMultipartParts(parsed, capabilities);
-  expect(parts).toBe(6);
+  expect(parts).toBe(2);
   const compiled = compileChatGptWebPrompt(parsed, capabilities, undefined, { experimentalMultipartParts: parts });
   expect(compiled.trimmedCompactionMessages).toBeUndefined();
   expect(compiled.multipart!.parts.flatMap(part => JSON.parse(part).records).map(record => record.message.content))
     .toEqual([parsed.context.messages[0]!.content]);
+});
+
+test("adaptive compaction does not select inline by discarding earlier context", () => {
+  const parsed = request("latest task");
+  parsed._compactionRequest = true;
+  parsed.context.messages.unshift({ role: "user", content: "important older requirement ".repeat(6_000), timestamp: 0 });
+  const parts = resolveBiggerContextMultipartParts(parsed, capabilities);
+  expect(parts).toBe(2);
+  const compiled = compileChatGptWebPrompt(parsed, capabilities, undefined, { experimentalMultipartParts: parts });
+  expect(compiled.trimmedCompactionMessages).toBeUndefined();
+  expect(compiled.multipart!.parts.flatMap(part => JSON.parse(part).records).map(record => record.message.content))
+    .toEqual(parsed.context.messages.map(message => message.content));
+});
+
+test("large compaction still selects six parts when two complete parts cannot fit", () => {
+  const parsed = request("");
+  parsed._compactionRequest = true;
+  parsed.context.messages = [50_000, 40_000, 50_000, 5_000]
+    .map((size, index) => ({ role: "user", content: "word ".repeat(size), timestamp: index }));
+  expect(resolveBiggerContextMultipartParts(parsed, { ...capabilities, extraHighAvailable: false, proAvailable: false })).toBe(6);
 });
 
 test("multipart planning leaves room for final attachments and execution instructions without losing history", () => {

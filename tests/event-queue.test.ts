@@ -25,3 +25,11 @@ test("closing the queue releases waiting consumers exactly once", async () => {
   queue.close();
   expect(await collected).toEqual(["one"]);
 });
+
+test("undefined is a valid queued value and does not discard later events", async () => {
+  const queue = new AsyncEventQueue<number | undefined>();
+  queue.push(undefined);
+  queue.push(7);
+  queue.close();
+  expect(await queue.collect()).toEqual([undefined, 7]);
+});
