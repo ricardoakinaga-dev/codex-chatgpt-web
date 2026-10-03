@@ -404,9 +404,10 @@ export function hasChatGptCalendarEnvironmentDelta(parsed: CodexParsedRequest): 
     if (item.role !== "user" || itemTurnId(item) !== turnId || typeof item.id !== "string" || !item.id
       || !hasAssistantOutputBetween(input, activeIndex + 1, index)) return false;
     const text = rawMessageText(item).trim();
+    // Codex 0.160+ also lists workspace_roots here; they are ignored (authority comes from the rollout).
     // Match the whole native fragment, not just the presence of a disabled profile: another
     // profile, a malformed cwd, or any additional permission declaration must fail closed.
-    if (!/^<environment_context>\s*<current_date>\d{4}-\d{2}-\d{2}<\/current_date>\s*(?:<timezone>[^<>]+<\/timezone>\s*)?<filesystem>\s*<permission_profile type="disabled">\s*<file_system type="unrestricted"\s*\/>\s*<\/permission_profile>\s*<\/filesystem>\s*<\/environment_context>$/.test(text)
+    if (!/^<environment_context>\s*<current_date>\d{4}-\d{2}-\d{2}<\/current_date>\s*(?:<timezone>[^<>]+<\/timezone>\s*)?<filesystem>\s*(?:<workspace_roots>\s*(?:<root>[^<>]+<\/root>\s*)+<\/workspace_roots>\s*)?<permission_profile type="disabled">\s*<file_system type="unrestricted"\s*\/>\s*<\/permission_profile>\s*<\/filesystem>\s*<\/environment_context>$/.test(text)
       || !sandboxMetadataMatchesEnvironment(canonicalSandboxMetadata(metadata), text)
       || [metadata.sandbox_mode, metadata.sandbox].some(value => (
         value !== undefined && !sandboxMetadataMatchesEnvironment(value, text)

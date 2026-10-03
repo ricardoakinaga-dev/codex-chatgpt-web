@@ -1003,6 +1003,13 @@ describe("trusted Codex task environment continuity", () => {
     expect(new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(request).cwd).toBe(root);
   });
 
+  test("a midnight delta that lists workspace_roots (Codex 0.160+) still resolves from the rollout", () => {
+    const { codexHome, request, delta } = midnightRolloutFixture();
+    delta.content[0]!.text = delta.content[0]!.text.replace("<filesystem>",
+      `<filesystem><workspace_roots><root>${root}</root></workspace_roots>`);
+    expect(new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(request).cwd).toBe(root);
+  });
+
   test("midnight recovery never borrows cached authority without exact current rollout proof", () => {
     const { codexHome, request, rolloutPath, delta } = midnightRolloutFixture();
     const store = new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome);
