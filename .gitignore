@@ -18,3 +18,6 @@ launcher/artifacts/
 output/
 notes.md
 /.agents/skills/github-pairing/
+
+# Local OpenCode session state
+/.opencode/goals/
