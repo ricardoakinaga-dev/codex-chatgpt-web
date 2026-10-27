@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { ChatGptBrowserWorker, throwIfChatGptSignedOutComposer } from "../src/adapters/chatgpt-web/browser-worker";
 import { ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
-import { CHATGPT_COMPOSER_SELECTOR, CHATGPT_TEMPORARY_CHAT_URL } from "../src/chatgpt-session";
+import { CHATGPT_COMPOSER_SELECTOR, CHATGPT_NEW_CHAT_URL } from "../src/chatgpt-session";
 
 const prepare = (ChatGptBrowserWorker.prototype as any).prepareChatSurface;
 const unavailable = () => new ChatGptWebAdapterError("ChatGPT composer did not appear", {
@@ -9,7 +9,7 @@ const unavailable = () => new ChatGptWebAdapterError("ChatGPT composer did not a
 });
 
 test("signed-out lightweight composer reports sign-in instead of a hydration timeout", async () => {
-  const page: any = { url: () => CHATGPT_TEMPORARY_CHAT_URL,
+  const page: any = { url: () => CHATGPT_NEW_CHAT_URL,
     locator: () => ({ isVisible: async () => true }),
     evaluate: async () => ({ status: 200, hasUser: false, hasAccessToken: false }),
   };
@@ -30,7 +30,7 @@ function fixture(options: { ready?: boolean; messages?: number; expired?: boolea
     && (typeof hasText === "string" ? "Your session has expired".includes(hasText) : hasText.test("Your session has expired")) ? alert : absent,
     last: () => alert, isVisible: async () => true };
   const page: any = {
-    url: () => CHATGPT_TEMPORARY_CHAT_URL,
+    url: () => CHATGPT_NEW_CHAT_URL,
     locator: (selector: string) => selector === CHATGPT_COMPOSER_SELECTOR ? composer
       : selector.includes('role="alert"') || selector.includes('role="dialog"') ? alert : absent,
     reload: async () => { reloads += 1; ready = options.recover !== false; },
@@ -92,7 +92,7 @@ test("cancellation reaches the hydration wait and never reloads the page", async
   f.worker.activeComposer = async (_page: unknown, _budget: number, signal?: AbortSignal) => new Promise((_resolve, reject) => {
     signal?.addEventListener("abort", () => reject(new DOMException("Cancelled", "AbortError")), { once: true });
   });
-  const result = prepare.call(f.worker, f.page, undefined, false, controller.signal);
+  const result = prepare.call(f.worker, f.page, undefined, controller.signal);
   controller.abort();
   await expect(result).rejects.toMatchObject({ name: "AbortError" });
   expect(f.reloads()).toBe(0);

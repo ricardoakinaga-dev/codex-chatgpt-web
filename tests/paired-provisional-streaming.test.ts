@@ -56,6 +56,29 @@ test("a rewritten provisional block holds emission and finish publishes the trut
   expect(final.delta).toBe("");
 });
 
+test("paired file references hold the mutable suffix until authoritative completion", () => {
+  const buffer = new ChatGptMarkdownBuffer();
+  expect(buffer.observe([
+    segment(0, "<p>Report</p>", "Report"),
+    segment(1, "<p>Preparing file</p>", "Preparing file", { mutableReference: true }),
+    segment(2, "<p>Draft suffix</p>", "Draft suffix"),
+  ], 0)).toBe("Report");
+  expect(buffer.observe([
+    segment(0, "<p>Report</p>", "Report"),
+    segment(1, "<p>Download report</p>", "Download report"),
+    segment(2, "<p>Final suffix</p>", "Final suffix"),
+  ], 100)).toBe("");
+  expect(buffer.finish().markdown).toBe("Report\n\nDownload report\n\nFinal suffix");
+});
+
+test("atomic compaction does not emit provisional paired text", () => {
+  const buffer = new ChatGptMarkdownBuffer(undefined, undefined, "complete");
+  expect(buffer.observe([segment(0, "<p>Draft</p>", "Draft")], 0)).toBe("");
+  expect(buffer.observe([segment(0, "<p>Final</p>", "Final")], 100)).toBe("");
+  expect(buffer.provisional).toBeFalse();
+  expect(buffer.finish().markdown).toBe("Final");
+});
+
 test("provisional multi-block answers separate blocks and finish authoritatively", () => {
   const buffer = new ChatGptMarkdownBuffer();
   const first = [

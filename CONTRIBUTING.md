@@ -1,5 +1,7 @@
 # Contributing
 
+For this fork, [`main` follows upstream and `custom` preserves local improvements](docs/fork-workflow.md).
+
 Codex Web GPT was created and is primarily developed and maintained by
 [@miuuyy](https://github.com/miuuyy). Product direction, core architecture, and release decisions
 remain with the creator. Other contributors listed by GitHub have provided focused external fixes

@@ -7,8 +7,6 @@ import { estimateChatGptWebInputTokens } from "../adapters/chatgpt-web/usage";
 import { RemoteTurnBroker, type TurnBrokerOwner } from "../adapters/chatgpt-web/turn-broker";
 import {
   CHATGPT_LUNA_BROWSER_INPUT_TOKEN_BUDGET,
-} from "../adapters/chatgpt-web/input-tokens";
-import {
   CHATGPT_WEB_LUNA_BACKEND_MODEL,
   requireChatGptWebModelRoute,
   resolveChatGptWebContextLimits,
@@ -401,7 +399,6 @@ export function createLauncherDevAdapter(
       turnTimeoutMs: 60 * 60_000,
       experimentalSkillAttachments: config.experimentalSkillAttachments,
       experimentalFreshConversationPerTurn: config.experimentalFreshConversationPerTurn,
-      useSavedChats: config.useSavedChats,
       ...(config.experimentalBiggerContext
         ? { experimentalBiggerContext: true }
         : {}),
@@ -422,7 +419,6 @@ export class DevChatDriver {
   open(name: string, requestedModel?: DevChatModel): { state: DevChatState; created: boolean } {
     const model = requestedModel ?? defaultDevChatModel(this.config);
     requireChatGptWebModelRoute(model, this.config);
-    this.assertBiggerContextModel(model);
     const opened = this.store.loadOrCreate(name, model, this.cwd);
     if (resolve(opened.state.cwd) !== resolve(this.cwd)) {
       throw new Error(`DEV chat ${JSON.stringify(name)} belongs to ${opened.state.cwd}; use another name for ${this.cwd}`);
@@ -432,14 +428,12 @@ export class DevChatDriver {
       this.store.save(opened.state);
     }
     requireChatGptWebModelRoute(opened.state.model, this.config);
-    this.assertBiggerContextModel(opened.state.model);
     if (opened.created) this.store.save(opened.state);
     return opened;
   }
 
   setModel(state: DevChatState, model: DevChatModel): void {
     requireChatGptWebModelRoute(model, this.config);
-    this.assertBiggerContextModel(model);
     state.model = model;
     this.store.save(state);
   }
@@ -574,15 +568,8 @@ export class DevChatDriver {
   }
 
   private shouldAutoCompact(state: DevChatState, context: DevContextStatus): boolean {
-    return !isLunaDevChatModel(state.model) && context.inputTokens >= context.autoCompactTokenLimit;
-  }
-
-  private assertBiggerContextModel(model: DevChatModel): void {
-    if (this.features.biggerContext && isLunaDevChatModel(model)) {
-      throw new Error(
-        "Bigger Context is unavailable for Luna because its accumulated browser transcript still shares one 28,000-token transport budget",
-      );
-    }
+    return (!isLunaDevChatModel(state.model) || this.config.experimentalBiggerContext === true)
+      && context.inputTokens >= context.autoCompactTokenLimit;
   }
 
   private statusForInput(state: DevChatState, turnId: string, input: unknown[]): DevContextStatus {
@@ -600,8 +587,11 @@ export class DevChatDriver {
       solAvailable: this.config.solAvailable,
       extraHighAvailable: this.config.extraHighAvailable === true,
       proAvailable: this.config.proAvailable,
-    });
-    const limits = resolveChatGptWebContextLimits(route.backendModel, route.adapterEffort, this.config);
+    }, this.config.experimentalBiggerContext ? { captureLunaCheckpoint: false } : {});
+    const limits = resolveChatGptWebContextLimits(
+      route.backendModel, route.adapterEffort, this.config,
+      route.interactionMode === "automatic" ? route.modelFamily : undefined,
+    );
     const autoCompactTokenLimit = limits.autoCompactTokenLimit;
     const contextWindow = limits.contextWindow;
     return {
@@ -623,7 +613,7 @@ export class DevChatDriver {
     reason: "automatic" | "manual",
     emit: (event: DevChatEvent) => void,
   ): Promise<unknown[]> {
-    if (isLunaDevChatModel(state.model)) {
+    if (isLunaDevChatModel(state.model) && !this.config.experimentalBiggerContext) {
       throw new Error("ChatGPT Web Luna uses its production rolling checkpoint and does not support a separate compact command");
     }
     const compactTurnId = id("dev_compact_turn");

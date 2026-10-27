@@ -1,10 +1,12 @@
 import { expect, test } from "bun:test";
-import { estimateChatGptWebInputTokens, resolveBiggerContextMultipartParts } from "../src/adapters/chatgpt-web/usage";
+import { estimateChatGptWebInputTokens, estimateChatGptWebUsage, resolveBiggerContextMultipartParts } from "../src/adapters/chatgpt-web/usage";
 import { compileChatGptWebPrompt } from "../src/adapters/chatgpt-web/prompt";
 import { compiledChatGptWebMessages, estimateChatGptWebImageTokens, estimateCompiledChatGptWebInputTokens } from "../src/adapters/chatgpt-web/input-tokens";
 import { assertChatGptWebMultipartInputWithinLimits, resolveChatGptWebMultipartStagingMode } from "../src/adapters/chatgpt-web/browser-worker";
 import { estimateTokens } from "../src/lib/token-estimate";
 import type { CodexParsedRequest } from "../src/types";
+import { resolveChatGptWebMessageTokenBudget, resolveChatGptWebStagingTokenBudget } from "../src/chatgpt-web-models";
+import { parseRequest } from "../src/responses/parser";
 
 const capabilities = { localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true };
 
@@ -16,6 +18,53 @@ function request(text: string): CodexParsedRequest {
     options: { reasoning: "high" },
   };
 }
+
+test.each([undefined, 2] as const)("context diagnostics separate instructions from history without logging contents (%s parts)", parts => {
+  const parsed = parseRequest({
+    model: "gpt-5.6-sol",
+    instructions: "PRIVATE_SYSTEM top-level instructions ".repeat(100),
+    input: [
+      { type: "additional_tools", role: "developer", tools: [{ type: "function", name: "PRIVATE_TOOL", parameters: { type: "object" } }] },
+      { type: "message", role: "developer", content: "PRIVATE_DEVELOPER instructions" },
+      { type: "message", role: "user", content: "PRIVATE_USER request" },
+      { type: "message", role: "assistant", content: "PRIVATE_ANSWER" },
+      { type: "function_call_output", call_id: "PRIVATE_CALL", output: "PRIVATE_RESULT" },
+    ],
+    reasoning: { effort: "high" },
+  });
+  const options = { experimentalMultipartParts: parts };
+  const plain = compileChatGptWebPrompt(parsed, capabilities, undefined, options);
+  const measured = compileChatGptWebPrompt(parsed, capabilities, undefined, { ...options, includeContextTokenBreakdown: true });
+  const { contextTokenBreakdown: counts, ...prompt } = measured;
+  expect(prompt).toEqual(plain);
+  expect(estimateCompiledChatGptWebInputTokens(measured, parsed.modelId))
+    .toBe(estimateCompiledChatGptWebInputTokens(plain, parsed.modelId));
+  expect(Object.keys(counts!).sort()).toEqual(["assistant", "developer", "system", "tool_result", "user"]);
+  expect(counts!.developer!.records).toBe(1); // additional_tools is a registry, not a developer message.
+  expect(counts!.system!.tokens).toBeGreaterThan(counts!.user!.tokens);
+  expect(JSON.stringify(counts)).not.toContain("PRIVATE");
+  const { sanitizeForExport } = require("../launcher/electron/logging.cjs");
+  const logLine = `[chatgpt-web] context_token_breakdown ${JSON.stringify({ byRole: counts })}`;
+  expect(sanitizeForExport(logLine)).toBe(logLine);
+  for (const group of Object.values(counts!)) {
+    expect(Object.keys(group).sort()).toEqual(["chars", "records", "tokens"]);
+    expect(group.records).toBe(1);
+    expect(group.tokens).toBeGreaterThan(0);
+  }
+});
+
+test("usage counts the configured plugin name carried by the submitted prompt", () => {
+  const parsed = request("Inspect the repository.");
+  const caps = { ...capabilities, localToolsEnabled: true };
+  const appName = `Codex ${"測試_".repeat(16)}`;
+  const token = `turn_${"0".repeat(32)}`;
+  const compiled = compileChatGptWebPrompt(parsed, caps, token, { appName });
+  const expected = estimateCompiledChatGptWebInputTokens(compiled, parsed.modelId);
+  expect(expected).not.toBe(estimateChatGptWebInputTokens(parsed, caps));
+  for (const biggerContext of [false, true]) {
+    expect(estimateChatGptWebUsage(parsed, {}, caps, biggerContext, false, appName).inputTokens).toBe(expected);
+  }
+});
 
 test.each([
   ["highly compressible", "a".repeat(480_000)],
@@ -29,7 +78,7 @@ test("multipart selection accounts for whole-record and composer fit before subm
   for (const [contents, expected] of [
     [["small task"], undefined],
     [[50_000, 40_000, 50_000, 5_000].map(n => "word ".repeat(n)), 6],
-    [Array.from({ length: 3 }, () => " ".repeat(450_000)), 2],
+    [Array.from({ length: 3 }, () => " ".repeat(450_000)), 6],
   ] as const) {
     const parsed = request("");
     parsed.context.messages = contents.map((content, index) => ({ role: "user", content, timestamp: index + 1 }));
@@ -91,6 +140,83 @@ test("large compaction still selects six parts when two complete parts cannot fi
     .map((size, index) => ({ role: "user", content: "word ".repeat(size), timestamp: index }));
   expect(resolveBiggerContextMultipartParts(parsed, { ...capabilities, extraHighAvailable: false, proAvailable: false })).toBe(6);
 });
+
+test("GPT-6 Sol stages complete Plus and Pro history with consistent usage accounting", () => {
+  const parsed = request("");
+  parsed._chatgptModelFamily = "6";
+  parsed.context.messages = Array.from({ length: 4 }, (_, index) => ({
+    role: "user", content: `record-${index}: ${"word ".repeat(24_000)}`, timestamp: index + 1,
+  }));
+  const original = structuredClone(parsed);
+  for (const proAvailable of [false, true]) {
+    const caps = { ...capabilities, proAvailable };
+    const parts = resolveBiggerContextMultipartParts(parsed, caps);
+    expect(parts).toBe(2);
+    const staged = compileChatGptWebPrompt(parsed, caps, undefined, { experimentalMultipartParts: parts });
+    expect(staged.multipart!.parts.flatMap(part => JSON.parse(part).records).map(record => record.message.content))
+      .toEqual(parsed.context.messages.map(message => message.content));
+    expect(estimateChatGptWebUsage(parsed, { answer: "done" }, caps, true).inputTokens)
+      .toBe(estimateCompiledChatGptWebInputTokens(staged, parsed.modelId));
+    expect(parsed).toEqual(original);
+  }
+}, 30_000);
+
+test("GPT-6 compaction respects the selected account and effort", () => {
+  const parsed = { ...request("Summarize this task."), _chatgptModelFamily: "6" as const, _compactionRequest: true };
+  for (const proAvailable of [false, true]) {
+    const caps = { ...capabilities, proAvailable };
+    for (const effort of ["low", "medium", "high", "xhigh"] as const) {
+      parsed.options.reasoning = effort;
+      const supported = effort !== "low";
+      const parts = resolveBiggerContextMultipartParts(parsed, caps);
+      if (supported) {
+        // The custom planner keeps small, complete checkpoints in a single message.
+        expect(parts).toBeUndefined();
+        const compiled = compileChatGptWebPrompt(parsed, caps, undefined, { experimentalMultipartParts: parts });
+        expect(compiled.multipart).toBeUndefined();
+        expect(compiled.trimmedCompactionMessages).toBeUndefined();
+        expect(compiled.text).toContain("Summarize this task.");
+      } else {
+        expect(parts).toBeUndefined();
+        expect(estimateChatGptWebUsage(parsed, { answer: "summary" }, caps, true))
+          .toEqual(estimateChatGptWebUsage(parsed, { answer: "summary" }, caps, false));
+        expect(() => compileChatGptWebPrompt(parsed, caps, undefined, { experimentalMultipartParts: 6 }))
+          .toThrow("GPT-6 Instant uses standard context");
+      }
+    }
+  }
+  parsed.options.reasoning = "max";
+  const parts = resolveBiggerContextMultipartParts(parsed, capabilities);
+  expect(parts).toBeUndefined();
+  const compiled = compileChatGptWebPrompt(parsed, capabilities, undefined, { experimentalMultipartParts: parts });
+  expect(compiled.multipart).toBeUndefined();
+  expect(compiled.trimmedCompactionMessages).toBeUndefined();
+  expect(compiled.text).toContain("Summarize this task.");
+});
+
+test("Plus history is rebalanced into smaller Instant uploads and a larger selected-mode final message", () => {
+  const plus = { ...capabilities, proAvailable: false, extraHighAvailable: false };
+  const parsed = request("");
+  parsed.context.messages = Array.from({ length: 60 }, (_, index) => ({
+    role: "user", content: `record-${index}: ${"word ".repeat(3000)}`, timestamp: index + 1,
+  }));
+  for (const compaction of [false, true]) {
+    parsed._compactionRequest = compaction;
+    const compiled = compileChatGptWebPrompt(parsed, plus, undefined, { experimentalMultipartParts: 6 });
+    const records = compiled.multipart!.parts.flatMap(part => JSON.parse(part).records);
+    expect(records.map(record => record.message.content)).toEqual(parsed.context.messages.map(message => message.content));
+    expect(compiled.trimmedCompactionMessages).toBeUndefined();
+    const messages = compiledChatGptWebMessages(compiled);
+    const stagingTokens = messages.slice(0, -1).map(text => estimateTokens(text));
+    const stagingBudget = resolveChatGptWebStagingTokenBudget("gpt-5.6-sol", "low", plus);
+    expect(Math.max(...stagingTokens)).toBeLessThanOrEqual(stagingBudget);
+    expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", plus,
+      Math.max(...stagingTokens), Math.max(...messages.slice(0, -1).map(text => text.length))).effort).toBe("low");
+    const finalTokens = estimateTokens(messages.at(-1)!);
+    expect(finalTokens).toBeGreaterThan(Math.max(...stagingTokens));
+    expect(finalTokens).toBeLessThanOrEqual(resolveChatGptWebMessageTokenBudget("gpt-5.6-sol", "high", plus));
+  }
+}, 30_000);
 
 test("multipart planning leaves room for final attachments and execution instructions without losing history", () => {
   for (const scenario of [

@@ -30,6 +30,20 @@ export function chatGptToolTimeoutError(tool: string, timeoutMs: number): ChatGp
   );
 }
 
+export function chatGptResponseIncompleteError(message: string): ChatGptWebAdapterError {
+  return new ChatGptWebAdapterError(message, {
+    status: 502, errorType: "server_error", code: "chatgpt_response_incomplete", retryable: false,
+  });
+}
+
+export function chatGptToolApprovalRequiredError(): ChatGptWebAdapterError {
+  return new ChatGptWebAdapterError(
+    "ChatGPT is waiting for plugin permission. Open the plugin's settings in ChatGPT, "
+    + 'then Permissions → Allow all actions, and retry this turn.',
+    { status: 403, errorType: "permission_error", code: "chatgpt_tool_approval_required", retryable: false },
+  );
+}
+
 // Only the compaction owner may signal this after the broker accepts its one-shot handoff.
 // It cancels browser observation, while the accepted summary remains the native result.
 export class ChatGptCompactionHandoffAccepted extends DOMException {

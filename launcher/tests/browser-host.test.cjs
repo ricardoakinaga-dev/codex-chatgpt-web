@@ -17,13 +17,167 @@ const {
   BrowserHost,
   IDLE_BROWSER_URL,
   isChatGptCloudflareChallengeResponse,
-  isTemporaryChatUrl,
+  isNewChatUrl,
   loadCommittedBrowserSurface,
   MANUAL_COMPACTION_SUBMIT_TIMEOUT_MS,
   MANUAL_SUBMIT_TIMEOUT_MS,
   navigationErrorForLog,
   navigationOriginForLog,
 } = require("../electron/browser-host.cjs");
+
+function scriptEvents() {
+  const events = new EventEmitter();
+  return { on: events.on.bind(events), off: events.off.bind(events), isCrashed: () => false };
+}
+
+function primaryLoginFixture() {
+  let loads = 0;
+  let probes = 0;
+  const contents = Object.assign(new EventEmitter(), {
+    setWindowOpenHandler() {}, isDestroyed: () => false, isLoadingMainFrame: () => true, stop() {},
+    getURL: () => "https://chatgpt.com/",
+    loadURL: async url => { loads++; contents.emit("did-start-navigation", {}, url, false, true); },
+  });
+  const host = Object.assign(Object.create(BrowserHost.prototype), {
+    state: { authenticated: false }, turnTabs: new Map(), view: { webContents: contents },
+    setState(patch) { Object.assign(this.state, patch); }, snapshot() { return { ...this.state }; },
+    logger: { info() {}, error() {} }, show() {}, activateHomeSurface() {},
+    armHomeNavigationTimeout() {}, clearHomeNavigationTimeout() {},
+    withManualOperation: async (_name, action) => action(),
+    probeAuthentication: async () => { probes++; return { authenticated: true }; },
+    runSessionInspection: async () => {},
+  });
+  host.bindWebContents();
+  return { host, contents, loads: () => loads, probes: () => probes };
+}
+
+test("failed primary navigation rejects login and an explicit retry replaces the failed document", async () => {
+  const { host, contents, loads, probes } = primaryLoginFixture();
+  contents.emit("did-fail-load", {}, -331, "ERR_NETWORK_IO_SUSPENDED", contents.getURL(), true);
+  await assert.rejects(host.waitForAuthenticated(), /ERR_NETWORK_IO_SUSPENDED/);
+  assert.equal(probes(), 0, "cached authentication cannot validate a failed page");
+  contents.emit("did-finish-load"); // Chromium's error document is not a recovered ChatGPT page.
+  assert.equal(host.state.status, "error");
+  host.state.authenticated = true; // The account cookie can outlive the failed document.
+  await host.openLogin();
+  assert.equal(loads(), 1);
+  assert.equal(host.primaryNavigationError, null);
+  await host.openLogin();
+  assert.equal(loads(), 1, "an authenticated, valid document is preserved");
+});
+
+test("nonfatal navigation events are ignored and a clean renderer exit does not auto-restart", async () => {
+  const { host, contents, loads } = primaryLoginFixture();
+  contents.emit("did-fail-load", {}, -331, "ERR_NETWORK_IO_SUSPENDED", contents.getURL(), false);
+  contents.emit("did-fail-load", {}, -3, "ERR_ABORTED", contents.getURL(), true);
+  await host.openLogin();
+  assert.equal(loads(), 0);
+  contents.emit("render-process-gone", {}, { reason: "clean-exit", exitCode: 0 });
+  await assert.rejects(host.waitForAuthenticated(), /renderer stopped: clean-exit/);
+  contents.emit("did-start-navigation", {}, contents.getURL(), true, true);
+  await assert.rejects(host.waitForAuthenticated(), /renderer stopped: clean-exit/);
+  await host.openLogin();
+  assert.equal(loads(), 1);
+});
+
+
+function recoveringRendererFixture() {
+  let url = "https://chatgpt.com/";
+  let dead = false;
+  let storageClears = 0;
+  let completeProbe;
+  const loads = [], events = [];
+  const contents = Object.assign(new EventEmitter(), {
+    isDestroyed: () => false, isCrashed: () => dead,
+    setWindowOpenHandler() {}, getURL: () => url, setBackgroundThrottling() {},
+    isLoadingMainFrame: () => false, stop() {},
+    session: { clearStorageData: async () => { storageClears++; } },
+    executeJavaScript: () => new Promise(resolve => { completeProbe = resolve; }),
+    loadURL: async next => {
+      loads.push(next);
+      contents.emit("did-start-navigation", {}, next, false, true);
+      url = next; dead = false;
+      await Promise.resolve();
+      contents.emit("did-finish-load");
+    },
+  });
+  const host = Object.assign(Object.create(BrowserHost.prototype), {
+    state: { authenticated: true, status: "ready" }, turnTabs: new Map(), view: { webContents: contents },
+    authenticationRevision: 0, primaryRendererReady: true,
+    setState(patch) { Object.assign(this.state, patch); }, snapshot() { return { ...this.state }; },
+    logger: { info(event) { events.push(event); }, error(event) { events.push(event); } },
+    markOwnedSurface: async () => {}, writeDescriptor() {}, syncViewVisibility() {}, applyViewportCss: async () => {},
+    show() {}, activateHomeSurface() {}, armHomeNavigationTimeout() {}, clearHomeNavigationTimeout() {},
+  });
+  host.bindWebContents();
+  return { host, contents, loads, events, storageClears: () => storageClears,
+    finishProbe: () => completeProbe?.({ sessionAuthenticated: true, newChat: true, composer: true }),
+    crash: () => { dead = true; contents.emit("render-process-gone", {}, { reason: "killed", exitCode: 9 }); },
+  };
+}
+
+test("a killed primary renderer retires its pending probe, recovers without clearing the session, and permits logout", async () => {
+  const fixture = recoveringRendererFixture();
+  const { host, contents, loads, events } = fixture;
+  const oldProbe = host.probeAuthentication();
+  fixture.crash();
+  await oldProbe;
+  await host.ready();
+  assert.deepEqual(loads, [IDLE_BROWSER_URL]);
+  assert.equal(host.primaryNavigationError, null);
+  assert.equal(host.primaryRendererReady, true);
+  assert.equal(host.authenticationProbe, null);
+  assert.equal(host.state.authenticated, true);
+  assert.equal(fixture.storageClears(), 0);
+  assert.ok(events.includes("browser.renderer_recovered"));
+  contents.executeJavaScript = async () => ({ sessionAuthenticated: false, newChat: true, composer: true, readyState: "complete" });
+  await host.logout();
+  assert.equal(host.manualOperation, null);
+  assert.equal(host.state.authenticated, false);
+  assert.equal(fixture.storageClears(), 1);
+  fixture.finishProbe(); // The old renderer's late result cannot authenticate a logged-out account.
+  await Promise.resolve();
+  assert.equal(host.state.authenticated, false);
+  assert.ok(events.includes("browser.logout_completed"));
+});
+
+test("renderer recovery waits for the current manual operation and does not restart a destroyed host", async () => {
+  const fixture = recoveringRendererFixture();
+  let finish;
+  const operation = fixture.host.withManualOperation("fixture", () => new Promise(resolve => { finish = resolve; }));
+  await Promise.resolve(); await Promise.resolve();
+  fixture.crash();
+  await Promise.resolve();
+  assert.deepEqual(fixture.loads, []);
+  finish();
+  await operation;
+  await fixture.host.ready();
+  assert.deepEqual(fixture.loads, [IDLE_BROWSER_URL]);
+  fixture.host.destroyed = true;
+  fixture.crash();
+  await Promise.resolve();
+  assert.equal(fixture.loads.length, 1);
+});
+
+test("a renderer crash during recovery fails once instead of entering a reload loop", async () => {
+  const fixture = recoveringRendererFixture();
+  let loads = 0;
+  fixture.contents.loadURL = async () => { loads++; fixture.crash(); };
+  fixture.crash();
+  await Promise.resolve();
+  await fixture.host.ready();
+  assert.equal(loads, 1);
+  assert.equal(fixture.host.state.status, "error");
+  assert.ok(fixture.events.includes("browser.renderer_recovery_failed"));
+});
+
+test("the primary navigation deadline is reported to the login waiter", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000_000 });
+  const { host, contents } = primaryLoginFixture();
+  BrowserHost.prototype.armHomeNavigationTimeout.call(host, contents, contents.getURL());
+  t.mock.timers.tick(60_000);
+  await assert.rejects(host.waitForAuthenticated(), /did not finish loading within 60 seconds/);
+});
 
 test("manual prompt handoff keeps ordinary turns at one minute and compaction at two minutes", () => {
   assert.equal(MANUAL_SUBMIT_TIMEOUT_MS, 60_000);
@@ -46,6 +200,7 @@ test("descriptor publishes native surface identities without inspecting renderer
   const contents = id => ({
     isDestroyed: () => false,
     getOrCreateDevToolsTargetId: () => { queried.push(id); return id; },
+    ...scriptEvents(),
     executeJavaScript: () => { throw new Error("Descriptor must not inspect renderer content"); },
   });
   const automatic = { surfaceId: "a".repeat(32), interactionMode: "automatic", view: { webContents: contents("auto-target") } };
@@ -188,7 +343,7 @@ test("primary browser bootstrap fails closed on navigation, renderer, and timeou
   }
 });
 
-function manualTabNavigationFixture(remoteError, chatUrl = "https://chatgpt.com/?temporary-chat=true") {
+function manualTabNavigationFixture(remoteError, chatUrl = "https://chatgpt.com/") {
   const calls = [];
   const logs = [];
   const terminal = [];
@@ -227,7 +382,7 @@ function manualTabNavigationFixture(remoteError, chatUrl = "https://chatgpt.com/
 }
 
 test("manual edit retry survives Electron superseding the ChatGPT navigation", async () => {
-  for (const chatUrl of ["https://chatgpt.com/?temporary-chat=true", "https://chatgpt.com/"]) {
+  for (const chatUrl of ["https://chatgpt.com/", "https://chatgpt.com/"]) {
     const observed = manualTabNavigationFixture(
       new Error(`ERR_ABORTED (-3) loading ${chatUrl}`), chatUrl,
     );
@@ -245,7 +400,7 @@ test("manual edit retry survives Electron superseding the ChatGPT navigation", a
 });
 
 test("manual ChatGPT navigation still fails closed on a real load failure", async () => {
-  const failure = new Error("ERR_FAILED (-2) loading 'https://chatgpt.com/?temporary-chat=true'");
+  const failure = new Error("ERR_FAILED (-2) loading 'https://chatgpt.com/'");
   failure.code = "ERR_FAILED";
   const observed = manualTabNavigationFixture(failure);
 
@@ -339,7 +494,7 @@ test("the idle home browser performs one bounded reload for a Cloudflare challen
     view: {
       webContents: {
         id: 42,
-        getURL: () => "https://chatgpt.com/?temporary-chat=true",
+        getURL: () => "https://chatgpt.com/",
         isDestroyed: () => false,
         loadURL: async (url) => calls.push(["loadURL", url]),
       },
@@ -364,7 +519,7 @@ test("the idle home browser performs one bounded reload for a Cloudflare challen
   await fixture.cloudflareChallengeRecovery;
 
   assert.deepEqual(calls.filter(([name]) => name === "loadURL"), [
-    ["loadURL", "https://chatgpt.com/?temporary-chat=true"],
+    ["loadURL", "https://chatgpt.com/"],
   ]);
   assert.equal(fixture.cloudflareChallengeRecoveryArmed, false);
 
@@ -388,7 +543,7 @@ function createContents() {
   };
   const webContents = {
     navigationHistory: history,
-    getURL: () => "https://chatgpt.com/?temporary-chat=true",
+    getURL: () => "https://chatgpt.com/",
     getTitle: () => "ChatGPT",
     isDestroyed: () => false,
     isLoading: () => false,
@@ -441,11 +596,12 @@ test("descriptor-owned home surface stays attached offscreen while another launc
   ]);
 });
 
-test("smoke preserves an already-hydrated Temporary Chat page", () => {
-  assert.equal(isTemporaryChatUrl("https://chatgpt.com/?temporary-chat=true"), true);
-  assert.equal(isTemporaryChatUrl("https://chatgpt.com/?temporary-chat=false"), false);
-  assert.equal(isTemporaryChatUrl("https://chatgpt.com/c/abc?temporary-chat=true"), false);
-  assert.equal(isTemporaryChatUrl("not a url"), false);
+test("smoke preserves an already-hydrated ordinary chat page", () => {
+  assert.equal(isNewChatUrl("https://chatgpt.com/"), true);
+  assert.equal(isNewChatUrl("https://chatgpt.com/?temporary-chat=false"), true);
+  assert.equal(isNewChatUrl("https://chatgpt.com/?temporary-chat=true"), false);
+  assert.equal(isNewChatUrl("https://chatgpt.com/c/abc?temporary-chat=true"), false);
+  assert.equal(isNewChatUrl("not a url"), false);
 });
 
 test("session inspection delegates navigation and capability detection to the shared browser helper", async () => {
@@ -463,8 +619,8 @@ test("session inspection delegates navigation and capability detection to the sh
         type: "result",
         value: {
           authenticated: true,
-          temporary: true,
-          url: "https://chatgpt.com/?temporary-chat=true",
+          newChat: true,
+          url: "https://chatgpt.com/",
           solAvailable: true,
           extraHighAvailable: true, proAvailable: true,
         },
@@ -476,8 +632,8 @@ test("session inspection delegates navigation and capability detection to the sh
 
   assert.deepEqual(inspected, {
     authenticated: true,
-    temporary: true,
-    url: "https://chatgpt.com/?temporary-chat=true",
+    newChat: true,
+    url: "https://chatgpt.com/",
     solAvailable: true,
     extraHighAvailable: true, proAvailable: true,
   });
@@ -494,11 +650,11 @@ test("session inspection fails closed on incomplete shared-helper capability evi
     descriptorPath: "/runtime/launcher-browser.json",
     getConnectorName: () => "Codex Native",
     logger: { info() {} },
-    view: { webContents: { getURL: () => "https://chatgpt.com/?temporary-chat=true" } },
+    view: { webContents: { getURL: () => "https://chatgpt.com/" } },
     refreshChatGptHomeDocument: async () => {},
     runBrowserHelperOperation: async () => ({
       type: "result",
-      value: { authenticated: true, temporary: true, url: "https://chatgpt.com/?temporary-chat=true" },
+      value: { authenticated: true, newChat: true, url: "https://chatgpt.com/" },
     }),
   });
   await assert.rejects(
@@ -587,6 +743,37 @@ test("hidden turn tabs receive an explicit renderer viewport before moving offsc
   assert.equal(tab.deviceEmulationDirty, false);
 });
 
+test("background tabs retain the measured browser pane size across selection and window visibility", () => {
+  const host = Object.assign(Object.create(BrowserHost.prototype), {
+    boundsReady: true,
+    bounds: { x: 280, y: 64, width: 710, height: 568 },
+    window: { getContentSize: () => [1120, 720] },
+  });
+  const hidden = host.hiddenTurnBounds();
+  assert.deepEqual(hidden, { x: 1121, y: 721, width: 710, height: 568 });
+  assert.ok(hidden.x > 1120 && hidden.y > 720, "the pane remains entirely offscreen");
+  const sizes = [];
+  const tab = {
+    status: "running", rendererReady: true, deviceEmulationDirty: true,
+    view: {
+      setBounds: ({ width, height }) => sizes.push([width, height]),
+      setVisible() {},
+      webContents: {
+        enableDeviceEmulation: ({ viewSize }) => sizes.push([viewSize.width, viewSize.height]),
+        disableDeviceEmulation() {},
+      },
+    },
+  };
+  host.presentTurnView(tab, false);
+  host.presentTurnView(tab, true);
+  host.presentTurnView(tab, false);
+  assert.ok(sizes.every(([width, height]) => width === 710 && height === 568));
+  // A real pane resize still updates every background renderer.
+  host.bounds = { ...host.bounds, width: 900, height: 640 };
+  host.presentTurnView(tab, false);
+  assert.deepEqual(tab.deviceEmulationViewport, { width: 900, height: 640 });
+});
+
 test("hidden primary checks retain a renderer viewport across resize and navigation, then restore native bounds", () => {
   const calls = [];
   let size = [1120, 720];
@@ -664,23 +851,23 @@ test("turn tabs use the hidden viewport when the launcher window is hidden", () 
   BrowserHost.prototype.syncViewVisibility.call(fixture);
 
   assert.deepEqual(events, [
-    ["home-bounds", { x: 1121, y: 721, width: 1120, height: 720 }],
+    ["home-bounds", { x: 1121, y: 721, width: 840, height: 656 }],
     ["home-visible", true],
     ["emulate", {
       screenPosition: "desktop",
-      screenSize: { width: 1120, height: 720 },
+      screenSize: { width: 840, height: 656 },
       viewPosition: { x: 0, y: 0 },
       deviceScaleFactor: 0,
-      viewSize: { width: 1120, height: 720 },
+      viewSize: { width: 840, height: 656 },
       scale: 1,
     }],
-    ["bounds", { x: 1121, y: 721, width: 1120, height: 720 }],
+    ["bounds", { x: 1121, y: 721, width: 840, height: 656 }],
     ["visible", true],
   ]);
-  assert.deepEqual(tab.deviceEmulationViewport, { width: 1120, height: 720 });
+  assert.deepEqual(tab.deviceEmulationViewport, { width: 840, height: 656 });
 });
 
-test("new turn tabs defer device emulation until their renderer finishes loading", () => {
+test("new turn tabs defer device emulation until their document is ready", () => {
   const events = [];
   const tab = {
     id: "tab-loading-viewport",
@@ -692,8 +879,8 @@ test("new turn tabs defer device emulation until their renderer finishes loading
       setBounds: bounds => events.push(["bounds", bounds]),
       setVisible: visible => events.push(["visible", visible]),
       webContents: {
-        enableDeviceEmulation: () => assert.fail("emulation started before did-finish-load"),
-        disableDeviceEmulation: () => assert.fail("emulation cleared before did-finish-load"),
+        enableDeviceEmulation: () => assert.fail("emulation started before dom-ready"),
+        disableDeviceEmulation: () => assert.fail("emulation cleared before dom-ready"),
       },
     },
   };
@@ -715,14 +902,59 @@ test("new turn tabs defer device emulation until their renderer finishes loading
   assert.equal(tab.deviceEmulationDirty, true);
 });
 
-test("visible turn tabs establish native bounds before clearing background emulation", () => {
+test("navigation restores the task viewport at DOM readiness without completing bootstrap early", async () => {
+  const emulations = [];
+  let ownershipMarks = 0;
+  const contents = Object.assign(new EventEmitter(), {
+    setWindowOpenHandler() {}, getURL: () => "https://chatgpt.com/",
+    enableDeviceEmulation: options => emulations.push(options.viewSize),
+  });
+  const tab = {
+    id: "navigating", status: "running", rendererReady: false,
+    bootstrapReady: false, deviceEmulationDirty: true,
+    view: { webContents: contents, setBounds() {}, setVisible() {} },
+  };
+  const host = Object.assign(Object.create(BrowserHost.prototype), {
+    turnTabs: new Map([[tab.id, tab]]), selectedTabId: "home",
+    boundsReady: true, bounds: { x: 280, y: 64, width: 840, height: 656 },
+    window: { getContentSize: () => [1120, 760], isVisible: () => false, isMinimized: () => false },
+    view: { setBounds() {}, setVisible() {} },
+    snapshot() { return {}; }, markTurnTabSurface: async () => { ownershipMarks++; },
+  });
+  host.bindTurnContents(tab);
+  contents.emit("did-start-navigation", {}, contents.getURL(), false, true);
+  host.syncViewVisibility();
+  assert.equal(emulations.length, 0);
+  contents.emit("dom-ready");
+  assert.deepEqual(emulations, [{ width: 840, height: 656 }]);
+  assert.equal(tab.loading, true);
+  assert.equal(tab.bootstrapReady, false);
+  assert.equal(ownershipMarks, 0);
+  contents.emit("did-start-navigation", {}, contents.getURL(), true, true);
+  contents.emit("did-start-navigation", {}, "https://example.com/iframe", false, false);
+  assert.equal(tab.rendererReady, true, "hash and iframe navigation must not invalidate the viewport");
+  contents.emit("did-finish-load");
+  await Promise.resolve();
+  assert.equal(tab.loading, false);
+  assert.equal(tab.bootstrapReady, true);
+  assert.equal(ownershipMarks, 1);
+  assert.equal(emulations.length, 1, "finishing resource loads must not resize the document again");
+  contents.emit("did-start-navigation", {}, contents.getURL(), false, true);
+  host.syncViewVisibility();
+  assert.equal(tab.rendererReady, false);
+  assert.equal(emulations.length, 1);
+  contents.emit("dom-ready");
+  assert.equal(emulations.length, 2, "each new document needs its viewport restored");
+});
+
+test("visible turn tabs keep the explicit viewport across background transitions", () => {
   const events = [];
   const tab = {
     id: "tab-visible-viewport",
     status: "running",
     rendererReady: true,
-    deviceEmulationViewport: { width: 1120, height: 720 },
-    deviceEmulationDirty: true,
+    deviceEmulationViewport: { width: 840, height: 656 },
+    deviceEmulationDirty: false,
     view: {
       setBounds: bounds => events.push(["bounds", bounds]),
       setVisible: visible => events.push(["visible", visible]),
@@ -754,13 +986,12 @@ test("visible turn tabs establish native bounds before clearing background emula
   BrowserHost.prototype.syncViewVisibility.call(fixture);
 
   assert.deepEqual(events, [
-    ["home-bounds", { x: 1121, y: 721, width: 1120, height: 720 }],
+    ["home-bounds", { x: 1121, y: 721, width: 840, height: 656 }],
     ["home-visible", true],
     ["bounds", { x: 280, y: 64, width: 840, height: 656 }],
-    ["disable-emulation"],
     ["visible", true],
   ]);
-  assert.equal(tab.deviceEmulationViewport, null);
+  assert.deepEqual(tab.deviceEmulationViewport, { width: 840, height: 656 });
   assert.equal(tab.deviceEmulationDirty, false);
 });
 
@@ -836,10 +1067,11 @@ test("guest and incomplete server sessions do not prove launcher authentication"
     view: {
       webContents: {
         isDestroyed: () => false,
-        getURL: () => "https://chatgpt.com/?temporary-chat=true",
+        getURL: () => "https://chatgpt.com/",
+        ...scriptEvents(),
         executeJavaScript: async () => ({
           composer: true,
-          temporary: true,
+          newChat: true,
           sessionAuthenticated: false,
           readyState: "complete",
         }),
@@ -863,10 +1095,11 @@ test("launcher authentication is established by the complete server session", as
     view: {
       webContents: {
         isDestroyed: () => false,
-        getURL: () => "https://chatgpt.com/?temporary-chat=true",
+        getURL: () => "https://chatgpt.com/",
+        ...scriptEvents(),
         executeJavaScript: async () => ({
           composer: true,
-          temporary: true,
+          newChat: true,
           sessionAuthenticated: true,
           readyState: "complete",
         }),
@@ -885,7 +1118,7 @@ test("launcher authentication is established by the complete server session", as
 test("a verified session stays signed in while its composer is unavailable", async () => {
   const vm = require("node:vm");
   const { createDocument } = require("@mixmark-io/domino");
-  const url = "https://chatgpt.com/?temporary-chat=true";
+  const url = "https://chatgpt.com/";
   for (const owned of [true, false]) {
     const document = createDocument(`<form ${owned ? "data-chatgpt-composer" : ""}>
       <div data-composer-markdown contenteditable="true" role="textbox"></div></form>`);
@@ -898,6 +1131,7 @@ test("a verified session stays signed in while its composer is unavailable", asy
       state: { authenticated: false }, activeTraceId: null, manualOperation: null,
       view: { webContents: {
         isDestroyed: () => false, getURL: () => url,
+        ...scriptEvents(),
         executeJavaScript: script => vm.runInNewContext(script, {
           location: { href: url },
           document: { readyState: "complete", querySelectorAll: selector => document.querySelectorAll(selector) },
@@ -919,7 +1153,7 @@ test("a verified session stays signed in while its composer is unavailable", asy
 
 test("session verification distinguishes a missing login from network and invalid-response failures", async () => {
   const vm = require("node:vm");
-  const url = "https://chatgpt.com/?temporary-chat=true";
+  const url = "https://chatgpt.com/";
   const sessionUrl = "https://chatgpt.com/api/auth/session";
   const response = (payload, overrides = {}) => ({
     ok: true, status: 200, url: sessionUrl,
@@ -951,6 +1185,7 @@ test("session verification distinguishes a missing login from network and invali
       state: { authenticated: true }, activeTraceId: null, manualOperation: null,
       view: { webContents: {
         isDestroyed: () => false, getURL: () => url,
+        ...scriptEvents(),
         executeJavaScript: async script => {
           if (item.rendererError) throw new Error("private-renderer-error");
           return await vm.runInNewContext(script, {
@@ -1000,10 +1235,11 @@ test("a turn sign-in redirect updates the launcher and survives stale session pr
     snapshot() { return this.state; },
     syncPowerSaveBlocker() {}, removeTurnTab() {},
     view: { webContents: {
-      isDestroyed: () => false, getURL: () => "https://chatgpt.com/?temporary-chat=true",
+      isDestroyed: () => false, getURL: () => "https://chatgpt.com/",
+      ...scriptEvents(),
       executeJavaScript: async () => {
         probes++;
-        return { sessionAuthenticated: true, composer: true, temporary: true, url: "https://chatgpt.com/?temporary-chat=true" };
+        return { sessionAuthenticated: true, composer: true, newChat: true, url: "https://chatgpt.com/" };
       },
     } },
     logger: { warn() {}, info() {} },
@@ -1039,7 +1275,7 @@ test("concurrent authentication probes share the same navigation and allow the n
   let probes = 0;
   let navigations = 0;
   let release;
-  let temporary = false;
+  let newChat = false;
   const ready = new Promise(resolve => { release = resolve; });
   const fixture = Object.assign(Object.create(BrowserHost.prototype), {
     turnTabs: new Map(),
@@ -1047,12 +1283,13 @@ test("concurrent authentication probes share the same navigation and allow the n
     view: { webContents: {
       isDestroyed: () => false,
       getURL: () => "https://chatgpt.com/",
+      ...scriptEvents(),
       executeJavaScript: async () => {
         probes += 1;
         await ready;
-        return { composer: true, temporary, sessionAuthenticated: true, url: "https://chatgpt.com/", readyState: "complete" };
+        return { composer: true, newChat, sessionAuthenticated: true, url: "https://chatgpt.com/", readyState: "complete" };
       },
-      loadURL: async () => { navigations += 1; temporary = true; },
+      loadURL: async () => { navigations += 1; newChat = true; },
     } },
     setState(patch) { this.state = { ...this.state, ...patch }; },
     snapshot() { return this.state; }, logger: { info() {} },
@@ -1062,7 +1299,7 @@ test("concurrent authentication probes share the same navigation and allow the n
   release();
   await Promise.all([first, second]);
   assert.equal(navigations, 1);
-  assert.equal(probes, 2); // initial surface, then the one navigated temporary surface
+  assert.equal(probes, 2); // initial surface, then the one navigated new-chat surface
   await fixture.probeAuthentication();
   assert.equal(probes, 3); // the settled operation must not cache stale authentication
 });
@@ -1120,13 +1357,14 @@ test("a later sign-out wins over pending native and page authentication probes",
   let finishNative;
   let finishPage;
   let requests = 0;
-  let url = "https://chatgpt.com/?temporary-chat=true";
+  let url = "https://chatgpt.com/";
   const updates = [];
   const fixture = Object.assign(Object.create(BrowserHost.prototype), {
     authenticationRevision: 0, state: { authenticated: false },
     turnTabs: new Map(),
     view: { webContents: {
       getURL: () => url, isDestroyed: () => false,
+      ...scriptEvents(),
       executeJavaScript: () => new Promise(resolve => { finishPage = resolve; }),
       session: { fetch: async url => {
         requests += 1;
@@ -1144,7 +1382,7 @@ test("a later sign-out wins over pending native and page authentication probes",
   assert.equal(first, second);
   finishNative({ user: { id: "previous-account" } });
   await second;
-  finishPage({ composer: true, temporary: true, sessionAuthenticated: true });
+  finishPage({ composer: true, newChat: true, sessionAuthenticated: true });
   await page;
   assert.equal(requests, 2);
   assert.equal(updates.length, 1);
@@ -1163,11 +1401,12 @@ test("session changes use the open page after invalidating an older check", asyn
     const fixture = Object.assign(Object.create(BrowserHost.prototype), {
       authenticationRevision: 0, state: { authenticated: false }, turnTabs: new Map(),
       view: { webContents: {
-        getURL: () => "https://chatgpt.com/?temporary-chat=true", isDestroyed: () => false,
+        getURL: () => "https://chatgpt.com/", isDestroyed: () => false,
+        ...scriptEvents(),
         executeJavaScript: async () => {
           pageChecks++;
           if (pageChecks === 1) await new Promise(resolve => { finishOld = resolve; });
-          return { composer: true, temporary: true, readyState: "complete", ...result };
+          return { composer: true, newChat: true, readyState: "complete", ...result };
         },
         session: { fetch: async () => { assert.fail("A loaded ChatGPT page owns session verification"); } },
       } },
@@ -1191,11 +1430,12 @@ test("sign-out during a refreshed page check rejects its earlier signed-in resul
   const fixture = Object.assign(Object.create(BrowserHost.prototype), {
     authenticationRevision: 0, state: { authenticated: false }, turnTabs: new Map(),
     view: { webContents: {
-      getURL: () => "https://chatgpt.com/?temporary-chat=true", isDestroyed: () => false,
+      getURL: () => "https://chatgpt.com/", isDestroyed: () => false,
+      ...scriptEvents(),
       executeJavaScript: async () => {
         const check = ++pageChecks;
         if (check === 1) await new Promise(resolve => { finishPage = resolve; });
-        return { sessionAuthenticated: check === 1, readyState: "complete", composer: true, temporary: true };
+        return { sessionAuthenticated: check === 1, readyState: "complete", composer: true, newChat: true };
       },
       session: { fetch: async () => { assert.fail("Must use the loaded page"); } },
     } },
@@ -1238,7 +1478,7 @@ test("concurrent embedded login requests share one authentication operation", as
     logger: { info() {} },
     view: {
       webContents: {
-        getURL: () => "https://chatgpt.com/?temporary-chat=true",
+        getURL: () => "https://chatgpt.com/",
         loadURL: async () => {},
       },
     },
@@ -1278,7 +1518,7 @@ test("explicit login waits for an in-flight saved-session refresh before taking 
     snapshot: () => ({ authenticated: true }),
     logger: { info() {} },
     view: { webContents: {
-      getURL: () => "https://chatgpt.com/?temporary-chat=true",
+      getURL: () => "https://chatgpt.com/",
       loadURL: async () => {},
     } },
     probeAuthentication: async () => calls.push("probe"),
@@ -1298,6 +1538,65 @@ test("explicit login waits for an in-flight saved-session refresh before taking 
   assert.deepEqual(calls, ["ChatGPT login", "probe", "inspect"]);
 });
 
+test("choosing passkey during embedded sign-in switches the owned operation instead of swallowing the click", async () => {
+  let finishCapture, opened;
+  const capture = new Promise(resolve => { finishCapture = resolve; });
+  const ready = new Promise(resolve => { opened = resolve; });
+  let captures = 0;
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    state: { authenticated: false }, manualOperation: null, loginOperation: null,
+    turnTabs: new Map(), ready: async () => {}, activateHomeSurface() {}, show() {}, hide() {},
+    view: { webContents: { isDestroyed: () => false, setBackgroundThrottling() {},
+      getURL: () => "https://chatgpt.com/" } },
+    logger: { info() {} }, setState(patch) { Object.assign(this.state, patch); },
+    snapshot() { return { ...this.state }; },
+    probeAuthentication: async () => ({ authenticated: false }),
+    loginWithPasskey: async onProgress => {
+      captures++;
+      onProgress("waiting");
+      opened();
+      await capture;
+      return { storageState: {} };
+    },
+    installPasskeyLogin: async () => { fixture.setState({ authenticated: true, status: "ready" }); },
+  });
+  const embedded = fixture.openLogin();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(fixture.manualOperation, "ChatGPT login");
+  const passkey = fixture.openPasskeyLogin();
+  assert.equal(passkey, embedded);
+  await ready;
+  assert.equal(captures, 1);
+  assert.equal(fixture.manualOperation, "ChatGPT passkey login");
+  assert.equal(fixture.state.passkeyPhase, "waiting");
+  assert.equal(fixture.openPasskeyLogin(), passkey);
+  finishCapture();
+  const result = await passkey;
+  assert.equal(result.authenticated, true);
+  assert.equal(result.passkeyPhase, null);
+  assert.equal(fixture.manualOperation, null);
+  assert.equal(fixture.loginOperation, null);
+  assert.equal(fixture.loginMode, null);
+});
+
+test("failed passkey launch clears its progress and releases the browser operation", async () => {
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    state: { authenticated: false }, turnTabs: new Map(),
+    ready: async () => {}, activateHomeSurface() {}, hide() {},
+    view: { webContents: { isDestroyed: () => false, setBackgroundThrottling() {} } },
+    logger: { info() {} }, setState(patch) { Object.assign(this.state, patch); },
+    snapshot() { return { ...this.state }; },
+    loginWithPasskey: async () => { throw new Error("Chrome could not start"); },
+  });
+  await assert.rejects(fixture.openPasskeyLogin(), /Chrome could not start/);
+  assert.equal(fixture.state.passkeyPhase, null);
+  assert.equal(fixture.state.loading, false);
+  assert.equal(fixture.state.status, "error");
+  assert.equal(fixture.state.authenticated, false);
+  assert.equal(fixture.manualOperation, null);
+  assert.equal(fixture.loginOperation, null);
+});
+
 test("passkey login imports only validated state and re-proves the Launcher session", async () => {
   const calls = [];
   const browserSession = {
@@ -1312,6 +1611,7 @@ test("passkey login imports only validated state and re-proves the Launcher sess
     session: browserSession,
     isDestroyed: () => false,
     loadURL: async url => calls.push(["load", url]),
+    ...scriptEvents(),
     executeJavaScript: async script => calls.push(["script", script]),
   };
   const fixture = Object.assign(Object.create(BrowserHost.prototype), {
@@ -1445,7 +1745,7 @@ test("launcher quit remains gated through an active embedded-browser operation",
 
 test("logout clears only the owned ChatGPT session and returns to the sign-in surface", async () => {
   const calls = [];
-  let currentUrl = "https://chatgpt.com/?temporary-chat=true";
+  let currentUrl = "https://chatgpt.com/";
   const authView = { webContents: { isDestroyed: () => false } };
   const fixture = {
     authView,
@@ -1492,7 +1792,7 @@ test("logout clears only the owned ChatGPT session and returns to the sign-in su
   assert.deepEqual(calls[0], ["manualOperation", "ChatGPT logout"]);
   assert.deepEqual(calls[1], ["closeAuthView", authView, true, false]);
   assert.deepEqual(calls[2], ["clearStorageData"]);
-  assert.deepEqual(calls[4], ["loadURL", "https://chatgpt.com/?temporary-chat=true"]);
+  assert.deepEqual(calls[4], ["loadURL", "https://chatgpt.com/"]);
   assert.ok(calls.some(([name]) => name === "activateHomeSurface"));
   assert.ok(calls.some(([name]) => name === "show"));
 });
@@ -1516,14 +1816,15 @@ test("launcher shutdown persists ChatGPT DOM storage and cookies before browser 
   assert.deepEqual(calls, ["storage", "cookies"]);
 });
 
-test("OAuth completion is re-proved on the primary Temporary Chat surface before login succeeds", async () => {
+test("OAuth completion is re-proved on the primary ordinary chat surface before login succeeds", async () => {
   let primaryReady = false;
   const completedAuthView = {
     webContents: {
       isDestroyed: () => false,
+      ...scriptEvents(),
       executeJavaScript: async () => ({
         composer: true,
-        temporary: false,
+        newChat: false,
         sessionAuthenticated: true,
         readyState: "complete",
       }),
@@ -1538,20 +1839,21 @@ test("OAuth completion is re-proved on the primary Temporary Chat surface before
     view: {
       webContents: {
         getURL: () => primaryReady
-          ? "https://chatgpt.com/?temporary-chat=true"
+          ? "https://chatgpt.com/"
           : "https://chatgpt.com/auth/login",
         isDestroyed: () => false,
+        ...scriptEvents(),
         executeJavaScript: async () => ({
           composer: primaryReady,
-          temporary: primaryReady,
+          newChat: primaryReady,
           sessionAuthenticated: primaryReady,
           readyState: "complete",
           url: primaryReady
-            ? "https://chatgpt.com/?temporary-chat=true"
+            ? "https://chatgpt.com/"
             : "https://chatgpt.com/auth/login",
         }),
         loadURL: async (url) => {
-          assert.equal(url, "https://chatgpt.com/?temporary-chat=true");
+          assert.equal(url, "https://chatgpt.com/");
           primaryReady = true;
         },
       },
@@ -1569,11 +1871,11 @@ test("OAuth completion is re-proved on the primary Temporary Chat surface before
   const result = await BrowserHost.prototype.probeAuthentication.call(fixture);
   assert.equal(result.authenticated, true);
   assert.equal(fixture.authView, null);
-  assert.equal(result.url, "https://chatgpt.com/?temporary-chat=true");
+  assert.equal(result.url, "https://chatgpt.com/");
 });
 
-test("a successful primary login redirect is re-proved on Temporary Chat before login completes", async () => {
-  let currentUrl = "https://chatgpt.com/";
+test("a successful primary login redirect is re-proved on ordinary chat before login completes", async () => {
+  let currentUrl = "https://chatgpt.com/c/after-login";
   const loadedUrls = [];
   const fixture = {
     activeTraceId: null,
@@ -1585,9 +1887,10 @@ test("a successful primary login redirect is re-proved on Temporary Chat before 
       webContents: {
         getURL: () => currentUrl,
         isDestroyed: () => false,
+        ...scriptEvents(),
         executeJavaScript: async () => ({
           composer: true,
-          temporary: currentUrl === "https://chatgpt.com/?temporary-chat=true",
+          newChat: currentUrl === "https://chatgpt.com/",
           sessionAuthenticated: true,
           readyState: "complete",
           url: currentUrl,
@@ -1604,18 +1907,19 @@ test("a successful primary login redirect is re-proved on Temporary Chat before 
 
   const result = await BrowserHost.prototype.probeAuthentication.call(fixture);
 
-  assert.deepEqual(loadedUrls, ["https://chatgpt.com/?temporary-chat=true"]);
+  assert.deepEqual(loadedUrls, ["https://chatgpt.com/"]);
   assert.equal(result.authenticated, true);
-  assert.equal(result.url, "https://chatgpt.com/?temporary-chat=true");
+  assert.equal(result.url, "https://chatgpt.com/");
 });
 
 test("an authenticated primary surface closes a stale embedded auth popup", async () => {
   const staleAuthView = {
     webContents: {
       isDestroyed: () => false,
+      ...scriptEvents(),
       executeJavaScript: async () => ({
         composer: false,
-        temporary: false,
+        newChat: false,
         sessionAuthenticated: false,
         readyState: "complete",
       }),
@@ -1630,14 +1934,15 @@ test("an authenticated primary surface closes a stale embedded auth popup", asyn
     logger: { info() {} },
     view: {
       webContents: {
-        getURL: () => "https://chatgpt.com/?temporary-chat=true",
+        getURL: () => "https://chatgpt.com/",
         isDestroyed: () => false,
+        ...scriptEvents(),
         executeJavaScript: async () => ({
           composer: true,
-          temporary: true,
+          newChat: true,
           sessionAuthenticated: true,
           readyState: "complete",
-          url: "https://chatgpt.com/?temporary-chat=true",
+          url: "https://chatgpt.com/",
         }),
       },
     },
@@ -1745,7 +2050,7 @@ test("browser chrome state is read from the owned WebContents", () => {
   });
   assert.deepEqual(state, {
     title: "ChatGPT",
-    url: "https://chatgpt.com/?temporary-chat=true",
+    url: "https://chatgpt.com/",
     loading: false,
     canGoBack: true,
     canGoForward: false,
@@ -1799,7 +2104,7 @@ test("browser helper operations fail closed when the configured connector name i
   assert.equal(helperCalls, 0);
 });
 
-test("connector verification is effort-independent and works while the browser surface is hidden", async () => {
+test("hidden connector verification uses an ordinary chat without selecting effort", async () => {
   const calls = [];
   const fixture = {
     helper: { executable: "/runtime/electron", script: "/runtime/browser-helper.cjs" },
@@ -1835,6 +2140,35 @@ test("connector verification is effort-independent and works while the browser s
   );
 });
 
+test("verification refresh and authentication always use an ordinary new chat", async () => {
+  const target = "https://chatgpt.com/";
+  for (const initial of [target, "https://chatgpt.com/c/existing", "about:blank",
+    "https://chatgpt.com/?temporary-chat=true"]) {
+    const calls = [];
+    let currentUrl = initial;
+    const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+      state: { authenticated: false }, authenticationRevision: 0, manualOperation: "connector verification", turnTabs: new Map(),
+      setState(patch) { Object.assign(this.state, patch); }, snapshot() { return { ...this.state }; },
+      logger: { info() {} },
+      view: { webContents: {
+        ...scriptEvents(), isDestroyed: () => false,
+        getURL: () => currentUrl,
+        loadURL: async (url) => { currentUrl = url; calls.push(["navigate", url]); },
+        executeJavaScript: async () => {
+          calls.push(["authenticate"]);
+          return { sessionAuthenticated: true, composer: true, newChat: true,
+            url: currentUrl, readyState: "complete" };
+        },
+      } },
+      hardRefreshHome: async () => calls.push(["refresh"]),
+    });
+    await fixture.refreshChatGptHomeDocument();
+    assert.deepEqual(calls, [initial === target ? ["refresh"] : ["navigate", target], ["authenticate"]]);
+    assert.equal(fixture.state.authenticated, true);
+    assert.equal(currentUrl, target);
+  }
+});
+
 test("connector verification records the helper failure in launcher diagnostics", async () => {
   const calls = [];
   const failure = new Error("ChatGPT connector proof did not leave a verified empty composer");
@@ -1849,6 +2183,7 @@ test("connector verification records the helper failure in launcher diagnostics"
     },
     setState: (patch) => calls.push(["state", patch]),
     refreshChatGptHomeDocument: async () => calls.push(["refresh"]),
+    getUseSavedChats: () => true,
     verifyConnectorWithBrowserHelper: async () => { throw failure; },
   };
 
@@ -1886,7 +2221,7 @@ test("a live helper retains exclusive ownership of its running turn", async () =
   );
 });
 
-test("a replacement helper takes over only after the previous owner exited", async () => {
+test("a replacement helper cannot acquire a running turn as a fresh submission after its owner exits", async () => {
   const deadPid = 2_147_483_647;
   const tab = {
     id: "tab-dead-owner",
@@ -1917,18 +2252,14 @@ test("a replacement helper takes over only after the previous owner exited", asy
     logger: { info() {}, warn: (event, detail) => warnings.push([event, detail]) },
   });
 
-  const lease = await BrowserHost.prototype.beginTurn.call(fixture, tab.traceId, false, process.pid);
-
-  assert.deepEqual(lease, {
-    surfaceId: tab.surfaceId,
-    tabId: tab.id,
-    reused: false,
-    connectorBound: false,
+  await assert.rejects(() => BrowserHost.prototype.beginTurn.call(fixture, tab.traceId, false, process.pid), {
+    code: "turn_owner_lost",
   });
-  assert.equal(tab.helperPid, process.pid);
-  assert.equal(warnings.length, 1);
-  assert.equal(warnings[0][0], "browser.stale_turn_owner_replaced");
-  assert.equal(warnings[0][1].previousHelperPid, deadPid);
+  assert.equal(tab.helperPid, deadPid);
+  assert.equal(tab.status, "running");
+  assert.equal(fixture.turnTabs.get(tab.id), tab);
+  assert.equal(fixture.selectedTabId, "home");
+  assert.equal(warnings.length, 0);
 });
 
 test("a live turn heartbeat refreshes its lease and rejects another helper", () => {
@@ -1974,7 +2305,7 @@ test("a viewport-refresh heartbeat reapplies hidden emulation before CDP reconne
     status: "running",
     lastHeartbeatAt: 1,
     rendererReady: true,
-    deviceEmulationViewport: { width: 1120, height: 720 },
+    deviceEmulationViewport: { width: 840, height: 656 },
     deviceEmulationDirty: false,
     view: {
       setBounds: bounds => events.push(["bounds", bounds]),
@@ -2009,7 +2340,7 @@ test("a viewport-refresh heartbeat reapplies hidden emulation before CDP reconne
   BrowserHost.prototype.heartbeatTurn.call(fixture, tab.traceId, tab.helperPid, true);
 
   assert.equal(events.filter(([kind]) => kind === "emulate").length, 1);
-  assert.deepEqual(tab.deviceEmulationViewport, { width: 1120, height: 720 });
+  assert.deepEqual(tab.deviceEmulationViewport, { width: 840, height: 656 });
   assert.equal(tab.deviceEmulationDirty, false);
 });
 
@@ -2148,6 +2479,96 @@ test("removing the final turn tab keeps the descriptor-owned idle host attached 
   ]);
 });
 
+test("expired failed tabs finish cleanup when Electron has already released their webContents", async () => {
+  const { fixture, tab } = failedAutomaticTurnFixture();
+  await fixture.endTurn(tab.traceId, tab.helperPid, "failed", false);
+  const live = { id: "live-tab", traceId: "live-trace", helperPid: 778, status: "running" };
+  fixture.turnTabs.set(live.id, live);
+  tab.view.webContents = undefined;
+  const published = [], descriptors = [];
+  fixture.snapshot = () => ({ ids: [...fixture.turnTabs.keys()], selected: fixture.selectedTabId });
+  fixture.publishState = state => published.push(state);
+  fixture.writeDescriptor = () => descriptors.push([...fixture.turnTabs.keys()]);
+  const expiry = tab.failedAt + 30 * 60_000;
+  fixture.lastTurnSweepAt = expiry - 1;
+  await fixture.reapExpiredTurnTabs(expiry);
+  assert.equal(fixture.turnTabs.has(tab.id), false);
+  assert.equal(fixture.turnTabs.get(live.id), live);
+  assert.equal(live.status, "running");
+  assert.equal(fixture.selectedTabId, live.id);
+  assert.deepEqual(published, [{ ids: [live.id], selected: live.id }]);
+  assert.deepEqual(descriptors, [[live.id]]);
+});
+
+test("external webContents destruction retires only its owning turn and cannot leave a stale tab", () => {
+  for (const interactionMode of ["automatic", "manual"]) {
+    for (const status of ["running", "ready", "error"]) {
+      const { fixture, tab } = failedAutomaticTurnFixture();
+      const events = [], terminals = [], calls = [];
+      const contents = Object.assign(new EventEmitter(), {
+        setWindowOpenHandler() {}, isDestroyed: () => false,
+        close() { calls.push("close"); },
+      });
+      Object.assign(tab, { interactionMode, status, view: { webContents: contents } });
+      const live = { id: "live-tab", status: "running" };
+      fixture.turnTabs.set(live.id, live);
+      fixture.logger.warn = event => events.push(event);
+      fixture.signalManualTerminal = (_tab, state) => terminals.push(state);
+      fixture.publishState = () => calls.push("publish");
+      fixture.writeDescriptor = () => calls.push("descriptor");
+      if (interactionMode === "manual") fixture.bindManualTurnContents(tab);
+      else fixture.bindTurnContents(tab);
+      // Real WebContentsView releases this property after an external CDP Page.close.
+      tab.view.webContents = undefined;
+      contents.isDestroyed = () => true;
+      contents.emit("destroyed");
+      assert.equal(fixture.turnTabs.has(tab.id), false);
+      assert.equal(fixture.turnTabs.get(live.id), live);
+      assert.equal(fixture.selectedTabId, live.id);
+      assert.equal(fixture.closedTurnOwners.get(tab.traceId), status === "running" ? tab.helperPid : undefined);
+      assert.deepEqual(terminals, interactionMode === "manual" ? ["failed"] : []);
+      assert.deepEqual(events, ["browser.tab_closed_externally"]);
+      assert.deepEqual(calls, ["publish", "descriptor"]);
+      contents.emit("destroyed");
+      assert.deepEqual(calls, ["publish", "descriptor"]);
+    }
+  }
+});
+
+test("destruction callbacks cannot repeat normal cleanup or remove a replacement owner", () => {
+  for (const scenario of ["normal-close", "host-teardown", "replacement-owner"]) {
+    const { fixture, tab } = failedAutomaticTurnFixture();
+    const events = [], calls = [];
+    const contents = Object.assign(new EventEmitter(), {
+      setWindowOpenHandler() {}, isDestroyed: () => false,
+      close() {
+        calls.push("close");
+        tab.view.webContents = undefined;
+        contents.isDestroyed = () => true;
+        contents.emit("destroyed");
+      },
+    });
+    tab.view.webContents = contents;
+    fixture.hide = () => {};
+    fixture.logger.warn = event => events.push(event);
+    fixture.publishState = () => calls.push("publish");
+    fixture.writeDescriptor = () => calls.push("descriptor");
+    fixture.bindTurnContents(tab);
+    const replacement = { ...tab, traceId: "replacement-trace" };
+    if (scenario === "normal-close") fixture.removeTurnTab(tab, false);
+    else {
+      if (scenario === "host-teardown") fixture.destroyed = true;
+      else fixture.turnTabs.set(tab.id, replacement);
+      contents.close();
+    }
+    assert.deepEqual(events, []);
+    assert.deepEqual(calls, scenario === "normal-close" ? ["close", "publish", "descriptor"] : ["close"]);
+    assert.equal(fixture.turnTabs.get(tab.id), scenario === "normal-close" ? undefined
+      : scenario === "host-teardown" ? tab : replacement);
+    assert.equal(fixture.closedTurnOwners.size, 0);
+  }
+});
+
 test("hard refresh accepts Chromium's completed loading cycle even without did-finish-load", async () => {
   const calls = [];
   const contents = new EventEmitter();
@@ -2156,7 +2577,7 @@ test("hard refresh accepts Chromium's completed loading cycle even without did-f
     calls.push("reload");
     queueMicrotask(() => {
       contents.emit("did-start-navigation", {
-        url: "https://chatgpt.com/?temporary-chat=true",
+        url: "https://chatgpt.com/",
         isMainFrame: true,
         isSameDocument: false,
       });
@@ -2186,13 +2607,13 @@ test("hard refresh ignores an old loading stop before its own main-frame navigat
     queueMicrotask(() => {
       contents.emit("did-stop-loading");
       contents.emit("did-start-navigation", {
-        url: "https://chatgpt.com/?temporary-chat=true",
+        url: "https://chatgpt.com/",
         isMainFrame: false,
         isSameDocument: false,
       });
       contents.emit("did-finish-load");
       contents.emit("did-start-navigation", {
-        url: "https://chatgpt.com/?temporary-chat=true",
+        url: "https://chatgpt.com/",
         isMainFrame: true,
         isSameDocument: false,
       });
@@ -2262,7 +2683,7 @@ test("launcher session refresh resolves persisted authentication before setup ac
   assert.deepEqual(calls, [
     ["operation", "session refresh"],
     ["state", { status: "loading", message: "Checking saved ChatGPT session" }],
-    ["load", "https://chatgpt.com/?temporary-chat=true"],
+    ["load", "https://chatgpt.com/"],
     ["probe"],
     ["state", { status: "ready", message: "ChatGPT is ready" }],
   ]);
@@ -2282,7 +2703,7 @@ test("concurrent launcher session refresh requests share one browser operation",
       return await action();
     },
     view: { webContents: {
-      getURL: () => "https://chatgpt.com/?temporary-chat=true",
+      getURL: () => "https://chatgpt.com/",
       loadURL: async () => {},
     } },
   };
@@ -2294,6 +2715,40 @@ test("concurrent launcher session refresh requests share one browser operation",
   finishProbe({ authenticated: true });
   await first;
   assert.equal(fixture.sessionRefreshOperation, null);
+});
+
+test("startup sign-in redirects become signed-out state while real navigation errors remain errors", async () => {
+  for (const redirected of [true, false]) {
+    let url = IDLE_BROWSER_URL;
+    const failure = Object.assign(new Error("navigation stopped"), { code: -3 });
+    const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+      state: { authenticated: true },
+      snapshot() { return { ...this.state }; },
+      setState(patch) { Object.assign(this.state, patch); },
+      withManualOperation: async (_name, action) => await action(),
+      view: { webContents: {
+        isDestroyed: () => false,
+        getURL: () => url,
+        loadURL: async () => {
+          if (redirected) url = "https://chatgpt.com/auth/login?next=%2F";
+          throw failure;
+        },
+        ...scriptEvents(),
+        executeJavaScript: async () => { throw new Error("must not probe a login page"); },
+      } },
+    });
+    if (redirected) {
+      const state = await fixture.refreshAuthentication();
+      assert.equal(state.status, "signed-out");
+      assert.equal(state.authenticated, false);
+      assert.equal(state.message, "Sign in to ChatGPT");
+    } else {
+      await assert.rejects(fixture.refreshAuthentication(), error => error === failure);
+      assert.equal(fixture.state.status, "error");
+      assert.equal(fixture.state.loading, false);
+    }
+    assert.equal(fixture.sessionRefreshOperation, null);
+  }
 });
 
 test("manual browser operations disable background throttling until completion", async () => {
@@ -2982,13 +3437,18 @@ test("a completed connector turn without binding is released instead of retained
   assert.equal(closed, true);
 });
 
-test("failed and aborted browser turns release their tab slots", async () => {
-  for (const status of ["failed", "aborted"]) {
+test("aborted, uninitialized and signed-out browser turns release their tab slots", async () => {
+  for (const [status, bootstrapReady, authenticationRequired] of [
+    ["aborted", true, false], ["failed", false, false], ["failed", true, true],
+  ]) {
     let closed = false;
     const tab = {
       id: `tab-${status}`,
       traceId: `trace_${status}`,
       helperPid: 777,
+      interactionMode: "automatic",
+      bootstrapReady,
+      authenticationRequired,
       status: "running",
       loading: true,
       view: { webContents: {
@@ -3025,6 +3485,96 @@ test("failed and aborted browser turns release their tab slots", async () => {
     assert.equal(tab.status, status === "aborted" ? "aborted" : "error");
     assert.equal(closed, true);
   }
+});
+
+function failedAutomaticTurnFixture() {
+  const closed = [];
+  const tab = {
+    id: "failed-tab", traceId: "failed-trace", helperPid: 777,
+    status: "running", interactionMode: "automatic", bootstrapReady: true,
+    conversationKey: "f".repeat(64), connectorIdentity: "Codex Native2", connectorBound: true,
+    approvalPending: true, turnProgress: { stage: "chatgpt", activeToolCalls: 0 },
+    view: { webContents: {
+      isDestroyed: () => false, setBackgroundThrottling() {}, close: () => closed.push(tab.id),
+    } },
+  };
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    turnTabs: new Map([[tab.id, tab]]), userCancelledTurnOwners: new Map(), closedTurnOwners: new Map(),
+    selectedTabId: tab.id, manualOperation: null,
+    window: { contentView: { removeChildView() {} } },
+    syncViewVisibility() {}, writeDescriptor() {}, publishState() {}, snapshot: () => ({ tabs: [] }),
+    hide() { throw new Error("do not hide the failed page the user is inspecting"); },
+    logger: { info() {} },
+    createTurnTab: async (traceId, helperPid, conversationKey, connectorIdentity) => {
+      const fresh = { id: "fresh-tab", surfaceId: "fresh-surface", traceId, helperPid,
+        conversationKey, connectorIdentity, status: "running", interactionMode: "automatic" };
+      fixture.turnTabs.set(fresh.id, fresh);
+      return fresh;
+    },
+  });
+  return { fixture, tab, closed };
+}
+
+test("failed ChatGPT pages remain inspectable but lose turn ownership and cannot become successful", async () => {
+  const { fixture, tab, closed } = failedAutomaticTurnFixture();
+  assert.deepEqual(await fixture.endTurn(tab.traceId, tab.helperPid, "failed", true, "Check the ChatGPT tab"),
+    { cancelledByUser: false });
+  assert.equal(fixture.turnTabs.get(tab.id), tab);
+  assert.equal(fixture.selectedTabId, tab.id);
+  assert.equal(tab.status, "error");
+  assert.equal(tab.message, "Check the ChatGPT tab");
+  assert.equal(tab.approvalPending, false);
+  assert.equal(tab.turnProgress, undefined);
+  assert.equal(tab.connectorBound, false);
+  assert.equal(fixture.activeTraceId, null);
+  assert.throws(() => fixture.heartbeatTurn(tab.traceId, tab.helperPid), /no longer running/);
+  assert.throws(() => fixture.setTurnApprovalPending(tab.traceId, tab.helperPid, true), /no longer running/);
+  await assert.rejects(() => fixture.endTurn(tab.traceId, 778, "failed", true), /helper ownership mismatch/);
+  await assert.rejects(() => fixture.endTurn(tab.traceId, tab.helperPid, "completed", true, undefined, true, true),
+    /already failed/);
+  const failedAt = tab.failedAt;
+  await fixture.endTurn(tab.traceId, tab.helperPid, "failed", true);
+  assert.equal(tab.failedAt, failedAt, "repeated end notifications cannot extend retention");
+  assert.deepEqual(closed, []);
+
+  fixture.lastTurnSweepAt = failedAt + 30 * 60_000 - 2;
+  await fixture.reapExpiredTurnTabs(failedAt + 30 * 60_000 - 1);
+  assert.equal(fixture.turnTabs.get(tab.id), tab, "helper liveness is irrelevant to a terminal page");
+  await fixture.reapExpiredTurnTabs(failedAt + 30 * 60_000);
+  assert.deepEqual(closed, [tab.id]);
+  assert.equal(fixture.turnTabs.size, 0);
+});
+
+test("failed pages cannot supply retained history and a same-trace retry gets a fresh document", async () => {
+  const { fixture, tab, closed } = failedAutomaticTurnFixture();
+  await fixture.endTurn(tab.traceId, tab.helperPid, "failed", false);
+  for (const traceId of [tab.traceId, "next-trace"]) {
+    await assert.rejects(() => fixture.beginTurn(traceId, false, 778, tab.conversationKey, tab.connectorIdentity, true),
+      error => error.code === "retained_conversation_unavailable");
+  }
+  assert.deepEqual(closed, []);
+  const next = await fixture.beginTurn("next-trace", false, 778, tab.conversationKey, tab.connectorIdentity);
+  assert.equal(next.reused, false);
+  assert.equal(fixture.turnTabs.get(tab.id), tab, "another turn does not immediately erase failure evidence");
+  fixture.turnTabs.delete(next.tabId);
+  const retry = await fixture.beginTurn(tab.traceId, false, 778, tab.conversationKey, tab.connectorIdentity);
+  assert.equal(retry.reused, false);
+  assert.notEqual(retry.tabId, tab.id);
+  assert.deepEqual(closed, [tab.id]);
+  assert.equal([...fixture.turnTabs.values()].filter(item => item.traceId === tab.traceId).length, 1);
+});
+
+test("failed pages free capacity before reusable conversations without evicting active error states", async () => {
+  const { fixture, tab, closed } = failedAutomaticTurnFixture();
+  await fixture.endTurn(tab.traceId, tab.helperPid, "failed", false);
+  const reusable = { id: "reusable", status: "ready", lastHeartbeatAt: 1 };
+  const activeError = { id: "active-error", status: "error", interactionMode: "automatic", lastHeartbeatAt: 1 };
+  fixture.turnTabs.set(reusable.id, reusable);
+  fixture.turnTabs.set(activeError.id, activeError);
+  assert.equal(fixture.evictOldestReclaimableTurnTab(), true);
+  assert.deepEqual(closed, [tab.id]);
+  assert.equal(fixture.turnTabs.get(reusable.id), reusable);
+  assert.equal(fixture.turnTabs.get(activeError.id), activeError);
 });
 
 function manualTurnFixture() {
@@ -3243,7 +3793,7 @@ test("manual navigation preserves initial setup but retires a completed page's c
     const navigate = (url, mainFrame = true) => inPlace
       ? contents.emit("did-navigate-in-page", {}, url, mainFrame)
       : contents.emit("did-start-navigation", {}, url, false, mainFrame);
-    navigate("https://chatgpt.com/?temporary-chat=true");
+    navigate("https://chatgpt.com/");
     assert.equal(tab.conversationKey, key);
     fixture.confirmManualSent(tab.id);
     fixture.markManualTurnStarted("manual_initial", process.pid);
@@ -3415,7 +3965,7 @@ test("manual hidden tabs use native view placement without DOM or device-emulati
   const fixture = Object.assign(Object.create(BrowserHost.prototype), {
     bounds: { x: 1, y: 2, width: 640, height: 480 },
     hiddenTurnBounds: () => ({ x: 1000, y: 1000, width: 800, height: 600 }),
-    enableHiddenTurnViewport: () => { throw new Error("manual tabs must not enable device emulation"); },
+    enableBrowserViewport: () => { throw new Error("manual tabs must not enable device emulation"); },
   });
   const tab = {
     interactionMode: "manual",
@@ -3440,7 +3990,7 @@ test("manual browser snapshots never read or expose page-controlled titles", () 
       canGoBack: () => false,
       canGoForward: () => false,
     },
-    getURL: () => "https://chatgpt.com/?temporary-chat=true",
+    getURL: () => "https://chatgpt.com/",
     getTitle: () => {
       pageTitleReads += 1;
       return "prompt-controlled title";
@@ -3456,7 +4006,7 @@ test("manual browser snapshots never read or expose page-controlled titles", () 
       title: "stale automatic title",
       status: "ready",
       message: "",
-      url: "https://chatgpt.com/?temporary-chat=true",
+      url: "https://chatgpt.com/",
       loading: false,
     },
     visible: true,
@@ -3532,6 +4082,7 @@ test("switching from Zero Risk to Automatic marks the already-loaded primary sur
     selectedTabId: "home",
     surfaceId: "automatic-primary-surface",
     view: { webContents: {
+      ...scriptEvents(),
       executeJavaScript: async script => { scripts.push(script); },
       isDestroyed: () => false,
     } },
@@ -3591,7 +4142,7 @@ test("Zero Risk reveal navigates without inspecting the ChatGPT DOM", async () =
     snapshot: () => ({ visible: true }),
   });
   assert.deepEqual(await fixture.reveal(false), { visible: true });
-  assert.deepEqual(calls, ["show", ["loadURL", "https://chatgpt.com/?temporary-chat=true"]]);
+  assert.deepEqual(calls, ["show", ["loadURL", "https://chatgpt.com/"]]);
 });
 
 test("Zero Risk fails closed at every primary-surface inspection boundary", async () => {
@@ -3600,7 +4151,8 @@ test("Zero Risk fails closed at every primary-surface inspection boundary", asyn
     getBrowserInteractionMode: () => "manual",
     view: { webContents: {
       isDestroyed: () => false,
-      getURL: () => "https://chatgpt.com/?temporary-chat=true",
+      getURL: () => "https://chatgpt.com/",
+      ...scriptEvents(),
       executeJavaScript: async () => { domOperations += 1; },
       insertCSS: async () => { domOperations += 1; return "css-key"; },
       removeInsertedCSS: async () => { domOperations += 1; },
@@ -3659,17 +4211,17 @@ test("off-on-off fresh conversation changes retire completed history before it c
   const vm = require("node:vm");
   const { releaseRetainedConversation } = require("../electron/retained-turn-release.cjs");
   const main = fs.readFileSync(resolve(__dirname, "../electron/main.cjs"), "utf8");
-  for (const savedChats of [false, true]) {
-    const property = savedChats ? "useSavedChats" : "experimentalFreshConversationPerTurn";
-    const method = savedChats ? "setUseSavedChats" : "setFreshConversationPerTurn";
-    const channel = savedChats ? "launcher:use-saved-chats" : "launcher:fresh-conversation-per-turn";
-    const nextChannel = savedChats ? "launcher:auto-approve-tool-calls" : "launcher:use-saved-chats";
+  {
+    const property = "experimentalFreshConversationPerTurn";
+    const method = "setFreshConversationPerTurn";
+    const channel = "launcher:fresh-conversation-per-turn";
+    const nextChannel = "launcher:auto-approve-tool-calls";
     const key = "a".repeat(64);
     const stale = { id: "old-chat", traceId: "old-turn", status: "ready", interactionMode: "automatic",
       conversationKey: key, connectorIdentity: "Codex Native2", connectorBound: true };
     const manual = { id: "manual-chat", status: "ready", interactionMode: "manual", conversationKey: "b".repeat(64) };
-    const state = { experimentalFreshConversationPerTurn: false, useSavedChats: false };
-    const config = { experimentalFreshConversationPerTurn: false, useSavedChats: false };
+    const state = { experimentalFreshConversationPerTurn: false };
+    const config = { experimentalFreshConversationPerTurn: false };
     let handler, failSetup = true, commit;
     const removed = [];
     const fixture = Object.assign(Object.create(BrowserHost.prototype), {
@@ -3706,9 +4258,9 @@ test("off-on-off fresh conversation changes retire completed history before it c
     fixture.turnTabs.set(running.id, running);
     commit();
     await enabling;
-    assert.deepEqual(removed, savedChats ? [stale.id, manual.id] : [stale.id]);
+    assert.deepEqual(removed, [stale.id]);
     assert.equal(fixture.turnTabs.get(running.id), running);
-    assert.equal(fixture.turnTabs.get(manual.id), savedChats ? undefined : manual);
+    assert.equal(fixture.turnTabs.get(manual.id), manual);
     fixture.turnTabs.delete(running.id);
     const disabling = handler(null, false);
     commit();
@@ -3717,6 +4269,6 @@ test("off-on-off fresh conversation changes retire completed history before it c
     assert.equal(lease.reused, false);
     assert.equal(lease.tabId, "new-chat");
     assert.equal(state[property], false);
-    assert.equal(fixture.turnTabs.get(manual.id), savedChats ? undefined : manual);
+    assert.equal(fixture.turnTabs.get(manual.id), manual);
   }
 });
